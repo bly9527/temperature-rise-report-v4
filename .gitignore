@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+release/
+configs/
+test_outputs/
+*.log
+*.csv
+*.xls
+*.xlsx
+!assets/底层模板.xlsx
+!assets/附表格式参考.xlsx
