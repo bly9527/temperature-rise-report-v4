@@ -292,14 +292,27 @@ def _add_picture_in_area(sheet, image_path, area_address, name):
     picture.Placement = EXCEL_MOVE_AND_SIZE
 
 
-def _assign_conditions(workbook, summary, state, registry):
+def _release_empty_condition_reservations(workbook, summary, state):
+    # Older versions reserved columns for unchecked, never-generated conditions.
+    # Release only empty reservations: no summary header/data and no detail sheet.
+    occupied = {col for col in range(4, 16)
+                if any(summary.Cells(row, col).Value is not None
+                       for row in range(4, 28))}
+    used_sheets = {sheet.Name.casefold() for sheet in workbook.Worksheets}
+    for key, record in list(state['conditions'].items()):
+        if (int(record['column']) not in occupied
+                and record['sheet'].casefold() not in used_sheets):
+            del state['conditions'][key]
+
+
+def _assign_conditions(workbook, summary, state, registry, selected_ids):
     mappings = state['conditions']
     headers = {col: str(summary.Cells(4, col).Value or '').strip()
                for col in range(4, 16)}
     occupied = {col for col in headers if headers[col] or any(
         summary.Cells(row, col).Value is not None for row in range(5, 28))}
-    occupied.update(int(record['column']) for record in mappings.values())
     used_sheets = {sheet.Name.casefold() for sheet in workbook.Worksheets}
+    occupied.update(int(record['column']) for record in mappings.values())
     used_sheets.update(record['sheet'].casefold() for record in mappings.values())
     registry_ids = [_record_id(item, 'condition') for item in registry]
     if len(set(registry_ids)) != len(registry_ids):
@@ -333,6 +346,8 @@ def _assign_conditions(workbook, summary, state, registry):
             else:
                 sheet_name = None
         else:
+            if key not in selected_ids:
+                continue
             col = next((c for c in range(4, 16) if c not in occupied), None)
             if col is None:
                 raise ValueError('总表最多容纳 12 个工况；已有工况也计入，不能覆盖“规格/判定”列')
@@ -349,9 +364,201 @@ def _assign_conditions(workbook, summary, state, registry):
         occupied.add(col)
         used_sheets.add(sheet_name.casefold())
     # 新增同名工况在已有工况完成旧列绑定后再分配。
-    pending = [item for item in registry if _record_id(item, 'condition') not in mappings]
+    pending = [item for item in registry
+               if _record_id(item, 'condition') in selected_ids
+               and _record_id(item, 'condition') not in mappings]
     if pending:
-        _assign_conditions(workbook, summary, state, pending)
+        _assign_conditions(workbook, summary, state, pending, selected_ids)
+
+
+def _validate_condition_positions(state):
+    records = list(state['conditions'].values())
+    columns = [int(record['column']) for record in records]
+    sheets = [record['sheet'].casefold() for record in records]
+    if (len(columns) != len(set(columns)) or any(c < 4 or c > 15 for c in columns)
+            or len(sheets) != len(set(sheets))
+            or any(s in ('总表', STATE_SHEET.casefold()) for s in sheets)):
+        raise ValueError('报告工况位置记录异常，请先核对报告；原报告未修改')
+
+
+def _compact_condition_columns(summary, state):
+    """Move only the condition cells, leaving specification columns and photos alone."""
+    occupied = {int(r['column']) for r in state['conditions'].values()}
+    occupied.update(col for col in range(4, 16)
+                    if any(summary.Cells(row, col).Value is not None
+                           for row in range(4, 28)))
+    moves = {source: target for target, source in enumerate(sorted(occupied), 4)}
+    for source, target in moves.items():
+        if source == target:
+            continue
+        old = summary.Range(summary.Cells(4, source), summary.Cells(27, source))
+        new = summary.Range(summary.Cells(4, target), summary.Cells(27, target))
+        old.Copy(new)
+        old.ClearContents()
+    for record in state['conditions'].values():
+        record['column'] = moves[int(record['column'])]
+
+
+def _order_condition_sheets(workbook, summary, state):
+    sheets = {s.Name.casefold(): s for s in workbook.Worksheets}
+    previous = summary
+    for record in sorted(state['conditions'].values(), key=lambda r: int(r['column'])):
+        sheet = sheets.get(record['sheet'].casefold())
+        if sheet is not None:
+            if sheet.Index != previous.Index + 1:
+                sheet.Move(None, previous)
+            previous = sheet
+
+
+def _condition_result_to_delete(summary, state, condition, registry):
+    key = _record_id(condition, 'condition')
+    if key in state['conditions']:
+        record = state['conditions'][key]
+        header = str(summary.Cells(4, int(record['column'])).Value or '').strip()
+        if header and header != record['name']:
+            raise ValueError('该工况的总表位置与记录不一致，请先核对报告；原报告未修改')
+        return key, record
+    name = str(condition.get('name') or '').strip()
+    if not name and condition.get('status') != '已插入':
+        return key, None
+    matches = [col for col in range(4, 16)
+               if str(summary.Cells(4, col).Value or '').strip() == name]
+    inserted = condition.get('status') == '已插入'
+    if not matches:
+        if inserted:
+            raise ValueError('未找到该工况对应的报告结果，请先核对报告；原报告未修改')
+        return key, None
+    owners = [r for r in state['conditions'].values() if int(r['column']) in matches]
+    if owners:
+        if inserted:
+            raise ValueError('同名结果属于其他工况，无法安全删除；原报告未修改')
+        return key, None  # An unchecked new namesake must not delete an existing result.
+    same_name = [r for r in registry if str(r.get('name') or '').strip() == name]
+    completed = [r for r in same_name if r.get('status') == '已插入']
+    if not inserted and completed:
+        return key, None
+    if len(matches) != 1 or (len(same_name) > 1 and not (
+            len(completed) == 1 and _record_id(completed[0], 'condition') == key)):
+        raise ValueError('旧报告存在重名工况，无法确定要删除的结果；原报告未修改')
+    sheet_name = sanitize_sheet_title(name)
+    if any(r['sheet'].casefold() == sheet_name.casefold()
+           for r in state['conditions'].values()):
+        raise ValueError('对应附表属于其他工况，无法安全删除；原报告未修改')
+    return key, {'name': name, 'column': matches[0], 'sheet': sheet_name}
+
+
+def _commit_condition_deletion(work_path, report_path, config_path, new_config):
+    """Stage both files; roll the workbook back if committing the config fails."""
+    fd, config_temp = tempfile.mkstemp(prefix='~condition_', suffix='.json',
+                                      dir=os.path.dirname(os.path.abspath(config_path)))
+    backup = None
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            json.dump(new_config, stream, ensure_ascii=False, indent=2)
+        if work_path is not None:
+            fd, backup = tempfile.mkstemp(prefix='~condition_backup_', suffix='.xlsx',
+                                          dir=os.path.dirname(report_path))
+            os.close(fd)
+            shutil.copy2(report_path, backup)
+            try:
+                os.replace(work_path, report_path)
+            except PermissionError as error:
+                raise PermissionError('请先关闭 Excel/WPS 中的工程报告，再重试删除。') from error
+        try:
+            os.replace(config_temp, config_path)
+        except OSError as error:
+            if backup is not None:
+                try:
+                    os.replace(backup, report_path)
+                except OSError as rollback_error:
+                    recovery = backup
+                    backup = None  # Keep the recovery copy if another app locked the report.
+                    raise RuntimeError(f'配置保存失败，报告备份保存在：{recovery}') from rollback_error
+            raise OSError('工程配置保存失败，删除未完成；请检查配置文件是否被占用。') from error
+    finally:
+        for path in (config_temp, backup):
+            if path and os.path.exists(path):
+                os.remove(path)
+
+
+def delete_condition_result(project_excel, condition, project_config, config_path,
+                            log_callback=None):
+    """Immediately remove one condition's output and persist its remaining config."""
+    log = log_callback or (lambda message: None)
+    report_path = os.path.abspath(project_excel)
+    if not os.path.isfile(report_path):
+        raise FileNotFoundError('工程报告不存在，请先核对报告路径；未删除工况。')
+    with open(report_path, 'rb') as stream:
+        original_hash = hashlib.sha256(stream.read()).digest()
+    registry = project_config.get('conditions', [])
+    key = _record_id(condition, 'condition')
+    if sum(_record_id(c, 'condition') == key for c in registry) != 1:
+        raise ValueError('工况编号异常，无法确定删除对象；原报告未修改')
+    new_config = dict(project_config)
+    new_config['conditions'] = [c for c in registry if _record_id(c, 'condition') != key]
+    fd, work_path = tempfile.mkstemp(prefix='~thermal_delete_', suffix='.xlsx',
+                                    dir=os.path.dirname(report_path))
+    os.close(fd)
+    try:
+        shutil.copy2(report_path, work_path)
+        import pythoncom
+        pythoncom.CoInitialize()
+        excel = book = None
+        changed = False
+        try:
+            excel = _create_spreadsheet_application(log)
+            excel.Visible = False
+            excel.DisplayAlerts = False
+            excel.AskToUpdateLinks = False
+            excel.EnableEvents = False
+            book = excel.Workbooks.Open(work_path, 0, False)
+            if book.ReadOnly:
+                raise PermissionError('报告无法编辑，请关闭 Excel/WPS 中的报告后重试。')
+            summary = book.Worksheets.Item('总表')
+            state = _load_report_state(book)
+            _validate_condition_positions(state)
+            key, record = _condition_result_to_delete(summary, state, condition, registry)
+            if record is not None:
+                sheet_name = record['sheet']
+                if sheet_name.casefold() in ('总表', STATE_SHEET.casefold()):
+                    raise ValueError('工况附表记录异常，不能删除总表；原报告未修改')
+                for sheet in book.Worksheets:
+                    if sheet.Name.casefold() == sheet_name.casefold():
+                        sheet.Delete()
+                        break
+                col = int(record['column'])
+                summary.Range(summary.Cells(4, col), summary.Cells(27, col)).ClearContents()
+                state['conditions'].pop(key, None)
+                _release_empty_condition_reservations(book, summary, state)
+                _compact_condition_columns(summary, state)
+                excel.CutCopyMode = False
+                _order_condition_sheets(book, summary, state)
+                _save_report_state(book, state)
+                summary.Activate()
+                book.Save()
+                changed = True
+            book.Close(False)
+            book = None
+        finally:
+            try:
+                if book is not None:
+                    book.Close(False)
+            finally:
+                try:
+                    if excel is not None:
+                        excel.Quit()
+                finally:
+                    pythoncom.CoUninitialize()
+        with open(report_path, 'rb') as stream:
+            if hashlib.sha256(stream.read()).digest() != original_hash:
+                raise ValueError('处理期间报告已被其他程序修改，请重新检查后再删除。')
+        _commit_condition_deletion(work_path if changed else None, report_path,
+                                   config_path, new_config)
+        log('已删除工况结果并整理总表排列。' if changed else '该工况尚无生成结果，已从工程配置移除。')
+        return new_config
+    finally:
+        if os.path.exists(work_path):
+            os.remove(work_path)
 
 
 def _write_summary(summary, prepared, channels_config, state):
@@ -728,10 +935,12 @@ def process_bulk_thermal_data(project_excel, condition_configs, fixed_images,
             reference_sheet = reference_book.Worksheets.Item(1)
             summary = output_book.Worksheets.Item('总表')
             state = _load_report_state(output_book)
-            columns = [int(r['column']) for r in state['conditions'].values()]
-            if len(columns) != len(set(columns)) or any(c < 4 or c > 15 for c in columns):
-                raise ValueError('报告工况列记录异常，请使用报告备份')
-            _assign_conditions(output_book, summary, state, registry)
+            _validate_condition_positions(state)
+            _release_empty_condition_reservations(output_book, summary, state)
+            _compact_condition_columns(summary, state)
+            excel.CutCopyMode = False
+            _assign_conditions(output_book, summary, state, registry,
+                               {item['id'] for item in prepared})
             _write_summary(summary, prepared, channels_config, state)
             legacy_hashes, expected_hashes = _excel_legacy_image_hashes(
                 output_book, summary, state, image_registry, work_path)
@@ -745,6 +954,7 @@ def process_bulk_thermal_data(project_excel, condition_configs, fixed_images,
                              f'扫描时间 A3:A{last_row}，温度 C1:'
                              f'{get_column_letter(len(channels_config) + 2)}{last_row}')
                 progress_callback(int((index + 1) / len(prepared) * 100))
+            _order_condition_sheets(output_book, summary, state)
             _save_report_state(output_book, state)
             summary.Activate()
             output_book.Save()

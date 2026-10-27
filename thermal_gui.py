@@ -5,6 +5,7 @@ import json
 import subprocess
 import shutil
 import uuid
+import PyQt5
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QFileDialog,
@@ -12,10 +13,18 @@ from PyQt5.QtWidgets import (
     QProgressBar, QTextEdit, QGroupBox, QMessageBox, QSplitter,
     QInputDialog, QListWidget, QListWidgetItem
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QLibraryInfo
 from PyQt5.QtGui import QFont
 
-from thermal_processor import process_bulk_thermal_data
+from thermal_processor import process_bulk_thermal_data, delete_condition_result
+
+def configure_qt_plugins():
+    # Some Qt5 Windows wheels lose non-ASCII characters in their built-in path.
+    # Use Python's Unicode package path when that default directory is invalid.
+    if not os.path.isdir(QLibraryInfo.location(QLibraryInfo.PluginsPath)):
+        plugin_dir = os.path.join(os.path.dirname(PyQt5.__file__), 'Qt5', 'plugins')
+        if os.path.isdir(plugin_dir):
+            QApplication.addLibraryPath(plugin_dir)
 
 def get_base_dir():
     if getattr(sys, 'frozen', False):
@@ -84,13 +93,33 @@ class WorkerThread(QThread):
             )
             self.finished_signal.emit()
         except Exception as e:
-            import traceback
-            self.error_signal.emit(f"{str(e)}\n{traceback.format_exc()}")
+            self.error_signal.emit(str(e).strip() or '报告生成失败，请检查输入数据后重试。')
 
     def progress_callback(self, val):
         self.progress_updated.emit(val)
     def log_callback(self, msg):
         self.log_updated.emit(msg)
+
+
+class DeleteConditionThread(QThread):
+    log_updated = pyqtSignal(str)
+    succeeded = pyqtSignal()
+    failed = pyqtSignal(str)
+
+    def __init__(self, report, condition, config, config_path):
+        super().__init__()
+        self.report = report
+        self.condition = condition
+        self.config = config
+        self.config_path = config_path
+
+    def run(self):
+        try:
+            delete_condition_result(self.report, self.condition, self.config,
+                                    self.config_path, self.log_updated.emit)
+            self.succeeded.emit()
+        except Exception as error:
+            self.failed.emit(str(error).strip() or '删除失败，请检查报告文件后重试。')
 
 
 class ThermalApp(QMainWindow):
@@ -554,14 +583,66 @@ class ThermalApp(QMainWindow):
         # 列5：操作
         btn_del = QPushButton("删除")
         btn_del.setObjectName("btn_danger")
-        btn_del.clicked.connect(lambda _, row=r: self.table_conds.removeRow(self.table_conds.indexAt(btn_del.pos()).row()))
+        condition_id = item.data(Qt.UserRole)
+        btn_del.clicked.connect(lambda _, key=condition_id: self.delete_condition(key))
         self.table_conds.setCellWidget(r, 5, btn_del)
+
+    def _operation_running(self):
+        return any(worker is not None and worker.isRunning()
+                   for worker in (getattr(self, 'worker', None),
+                                  getattr(self, 'delete_worker', None)))
+
+    def closeEvent(self, event):
+        if self._operation_running():
+            QMessageBox.warning(self, '正在处理', '报告正在处理中，请完成后再关闭软件。')
+            event.ignore()
+        else:
+            event.accept()
+
+    def delete_condition(self, condition_id):
+        if self._operation_running():
+            QMessageBox.warning(self, '正在处理', '请等待当前报告操作完成后再删除工况。')
+            return
+        config = self.collect_project_config()
+        if not config:
+            QMessageBox.warning(self, '无法删除', '请先新建或选择工程。')
+            return
+        condition = next((c for c in config['conditions'] if c['id'] == condition_id), None)
+        if condition is None:
+            return
+        reply = QMessageBox.question(
+            self, '确认删除工况',
+            f"确定删除工况【{condition['name']}】吗？\n\n"
+            '将同时删除该工况的附表和总表数据，剩余工况向左排列。\n'
+            '工程报告、其他工况及原始 CSV/图片文件会保留。',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        config_path = os.path.join(self.cfg_dir, f'{self.cbo_projects.currentText()}.json')
+        self.centralWidget().setEnabled(False)
+        self.log(f"正在删除工况：{condition['name']}")
+        self.delete_worker = DeleteConditionThread(
+            self.current_project_excel, condition, config, config_path)
+        self.delete_worker.log_updated.connect(self.log)
+        self.delete_worker.succeeded.connect(self.on_condition_deleted)
+        self.delete_worker.failed.connect(self.on_condition_delete_error)
+        self.delete_worker.start()
+
+    def on_condition_deleted(self):
+        self.centralWidget().setEnabled(True)
+        self.on_project_changed()
+        self.log('工况已删除，报告已保存；新增工况生成时会接在剩余工况之后。')
+
+    def on_condition_delete_error(self, message):
+        self.centralWidget().setEnabled(True)
+        self.log(f'删除失败：{message}')
+        QMessageBox.critical(self, '删除失败', message)
 
     def pick_file(self, line_edit, filter_str):
         fpath, _ = QFileDialog.getOpenFileName(self, "选择文件", "", filter_str)
         if fpath: line_edit.setText(fpath)
 
-    def save_project_config(self):
+    def collect_project_config(self):
         proj_name = self.cbo_projects.currentText()
         if not proj_name: return
 
@@ -611,7 +692,13 @@ class ThermalApp(QMainWindow):
                 "status": status
             })
 
-        cfg_path = os.path.join(self.cfg_dir, f"{proj_name}.json")
+        return cfg
+
+    def save_project_config(self):
+        cfg = self.collect_project_config()
+        if cfg is None:
+            return
+        cfg_path = os.path.join(self.cfg_dir, f"{self.cbo_projects.currentText()}.json")
         with open(cfg_path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
         self.log(f"已保存当前配置。")
@@ -624,6 +711,8 @@ class ThermalApp(QMainWindow):
             QMessageBox.warning(self, "错误", "工程Excel不存在！")
 
     def run_generation(self):
+        if self._operation_running():
+            return
         if not os.path.exists(self.current_project_excel):
             QMessageBox.warning(self, "错误", "工程Excel不存在，请先新建！")
             return
@@ -706,6 +795,7 @@ class ThermalApp(QMainWindow):
                     fixed_images.append({'id': item.data(Qt.UserRole), 'path': item.text()})
                     self.active_generating_img_rows.append(r)
 
+        self.centralWidget().setEnabled(False)
         self.btn_run.setEnabled(False)
         self.progress_bar.setValue(0)
 
@@ -718,6 +808,7 @@ class ThermalApp(QMainWindow):
         self.worker.start()
 
     def on_process_finished(self):
+        self.centralWidget().setEnabled(True)
         self.pending_image_deletions = []
         self.deleted_image_records = []
         self.btn_run.setEnabled(True)
@@ -758,11 +849,13 @@ class ThermalApp(QMainWindow):
         self.open_current_excel()
 
     def on_process_error(self, err_msg):
+        self.centralWidget().setEnabled(True)
         self.btn_run.setEnabled(True)
         self.log(f"执行失败: {err_msg}")
         QMessageBox.critical(self, "生成失败", err_msg)
 
 if __name__ == "__main__":
+    configure_qt_plugins()
     app = QApplication(sys.argv)
     window = ThermalApp()
     window.show()
