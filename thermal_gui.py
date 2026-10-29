@@ -196,6 +196,10 @@ class ThermalApp(QMainWindow):
         lyt_ch.addLayout(lyt_ch_tools)
 
         self.table_channels = QTableWidget(60, 3)
+        # Qt 5 on Windows can recurse in IME handling when typing directly
+        # into a selected cell in a table containing setCellWidget widgets.
+        # Create the real editor on selection, before the first IME keystroke.
+        self.table_channels.setEditTriggers(QTableWidget.AllEditTriggers)
         self.table_channels.setHorizontalHeaderLabels(["启用/硬件名", "自定义命名(输出用)", "报警限值(℃)"])
         self.table_channels.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table_channels.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
@@ -265,6 +269,7 @@ class ThermalApp(QMainWindow):
         lyt_cond.addLayout(lyt_cond_tools)
 
         self.table_conds = QTableWidget(0, 6)
+        self.table_conds.setEditTriggers(QTableWidget.AllEditTriggers)
         self.table_conds.setHorizontalHeaderLabels(["启用", "状态", "工况名(表头)", "CSV 路径", "Power-Z 截图", "操作"])
         self.table_conds.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table_conds.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
