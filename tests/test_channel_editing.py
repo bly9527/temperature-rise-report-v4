@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import thermal_gui as gui
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QItemSelectionModel
 from PyQt5.QtGui import QInputMethodEvent
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QLineEdit
@@ -75,6 +75,22 @@ class ChannelEditingTests(unittest.TestCase):
         self.assertTrue(checkbox.isChecked())
         QTest.mouseClick(checkbox, Qt.LeftButton)
         self.assertFalse(checkbox.isChecked())
+
+    def test_multi_selection_confirmation_can_be_cancelled(self):
+        self.window.add_cond_row('第二工况')
+        self.window.add_cond_row('第三工况')
+        table = self.window.table_conds
+        selection = table.selectionModel()
+        for row in (0, 2):
+            selection.select(table.model().index(row, 2),
+                             QItemSelectionModel.Select | QItemSelectionModel.Rows)
+        with patch.object(gui.QMessageBox, 'question', return_value=gui.QMessageBox.No) as ask:
+            self.window.delete_selected_conditions()
+        self.assertEqual(table.rowCount(), 3)
+        message = ask.call_args.args[2]
+        self.assertIn('原工况', message)
+        self.assertIn('第三工况', message)
+        self.assertNotIn('第二工况', message)
 
 
 if __name__ == '__main__':

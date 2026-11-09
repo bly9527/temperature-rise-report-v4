@@ -483,7 +483,13 @@ def _commit_condition_deletion(work_path, report_path, config_path, new_config):
 
 def delete_condition_result(project_excel, condition, project_config, config_path,
                             log_callback=None):
-    """Immediately remove one condition's output and persist its remaining config."""
+    return delete_condition_results(project_excel, [condition], project_config,
+                                    config_path, log_callback)
+
+
+def delete_condition_results(project_excel, conditions, project_config, config_path,
+                             log_callback=None):
+    """Remove selected results and persist the report and config together."""
     log = log_callback or (lambda message: None)
     report_path = os.path.abspath(project_excel)
     if not os.path.isfile(report_path):
@@ -491,11 +497,13 @@ def delete_condition_result(project_excel, condition, project_config, config_pat
     with open(report_path, 'rb') as stream:
         original_hash = hashlib.sha256(stream.read()).digest()
     registry = project_config.get('conditions', [])
-    key = _record_id(condition, 'condition')
-    if sum(_record_id(c, 'condition') == key for c in registry) != 1:
+    keys = [_record_id(c, 'condition') for c in conditions]
+    if not keys or len(keys) != len(set(keys)) or any(
+            sum(_record_id(c, 'condition') == key for c in registry) != 1
+            for key in keys):
         raise ValueError('工况编号异常，无法确定删除对象；原报告未修改')
     new_config = dict(project_config)
-    new_config['conditions'] = [c for c in registry if _record_id(c, 'condition') != key]
+    new_config['conditions'] = [c for c in registry if _record_id(c, 'condition') not in keys]
     fd, work_path = tempfile.mkstemp(prefix='~thermal_delete_', suffix='.xlsx',
                                     dir=os.path.dirname(report_path))
     os.close(fd)
@@ -517,8 +525,14 @@ def delete_condition_result(project_excel, condition, project_config, config_pat
             summary = book.Worksheets.Item('总表')
             state = _load_report_state(book)
             _validate_condition_positions(state)
-            key, record = _condition_result_to_delete(summary, state, condition, registry)
-            if record is not None:
+            targets = [_condition_result_to_delete(summary, state, condition, registry)
+                       for condition in conditions]
+            columns = [int(record['column']) for _, record in targets if record is not None]
+            if len(columns) != len(set(columns)):
+                raise ValueError('所选工况对应同一总表列，无法安全删除；原报告未修改')
+            for key, record in targets:
+                if record is None:
+                    continue
                 sheet_name = record['sheet']
                 if sheet_name.casefold() in ('总表', STATE_SHEET.casefold()):
                     raise ValueError('工况附表记录异常，不能删除总表；原报告未修改')
@@ -529,6 +543,8 @@ def delete_condition_result(project_excel, condition, project_config, config_pat
                 col = int(record['column'])
                 summary.Range(summary.Cells(4, col), summary.Cells(27, col)).ClearContents()
                 state['conditions'].pop(key, None)
+                changed = True
+            if changed:
                 _release_empty_condition_reservations(book, summary, state)
                 _compact_condition_columns(summary, state)
                 excel.CutCopyMode = False
@@ -536,7 +552,6 @@ def delete_condition_result(project_excel, condition, project_config, config_pat
                 _save_report_state(book, state)
                 summary.Activate()
                 book.Save()
-                changed = True
             book.Close(False)
             book = None
         finally:
@@ -554,7 +569,7 @@ def delete_condition_result(project_excel, condition, project_config, config_pat
                 raise ValueError('处理期间报告已被其他程序修改，请重新检查后再删除。')
         _commit_condition_deletion(work_path if changed else None, report_path,
                                    config_path, new_config)
-        log('已删除工况结果并整理总表排列。' if changed else '该工况尚无生成结果，已从工程配置移除。')
+        log('已删除所选工况并整理总表排列。' if changed else '所选工况尚无生成结果，已从工程配置移除。')
         return new_config
     finally:
         if os.path.exists(work_path):
@@ -809,9 +824,15 @@ def _write_detail(excel, workbook, reference_sheet, cond, channels_config,
         if sheet.Name == name:
             sheet.Delete()
             break
-    # pywin32 的动态 COM 调用需按位置传递 After；仅用关键字会另建工作簿。
-    reference_sheet.Copy(None, workbook.Worksheets(workbook.Worksheets.Count))
-    sheet = workbook.Worksheets(workbook.Worksheets.Count)
+    # The state sheet is veryHidden and may be the final worksheet. Excel
+    # inserts a copy before it, so Worksheets(Count) would refer to the state
+    # sheet and rename it instead of the new detail sheet.
+    last_visible = next(s for s in reversed(list(workbook.Worksheets)) if s.Visible == -1)
+    position = last_visible.Index
+    reference_sheet.Copy(None, last_visible)
+    sheet = workbook.Worksheets(position + 1)
+    if sheet.Name == STATE_SHEET or sheet.Visible != -1:
+        raise RuntimeError('无法确认新附表的位置，报告未修改')
     sheet.Name = name
     for chart_idx in range(sheet.ChartObjects().Count, 0, -1):
         sheet.ChartObjects().Item(chart_idx).Delete()

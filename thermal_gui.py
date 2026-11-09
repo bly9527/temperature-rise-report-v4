@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QLibraryInfo
 from PyQt5.QtGui import QFont
 
-from thermal_processor import process_bulk_thermal_data, delete_condition_result
+from thermal_processor import process_bulk_thermal_data, delete_condition_results
 
 def configure_qt_plugins():
     # Some Qt5 Windows wheels lose non-ASCII characters in their built-in path.
@@ -106,17 +106,17 @@ class DeleteConditionThread(QThread):
     succeeded = pyqtSignal()
     failed = pyqtSignal(str)
 
-    def __init__(self, report, condition, config, config_path):
+    def __init__(self, report, conditions, config, config_path):
         super().__init__()
         self.report = report
-        self.condition = condition
+        self.conditions = conditions
         self.config = config
         self.config_path = config_path
 
     def run(self):
         try:
-            delete_condition_result(self.report, self.condition, self.config,
-                                    self.config_path, self.log_updated.emit)
+            delete_condition_results(self.report, self.conditions, self.config,
+                                     self.config_path, self.log_updated.emit)
             self.succeeded.emit()
         except Exception as error:
             self.failed.emit(str(error).strip() or '删除失败，请检查报告文件后重试。')
@@ -265,11 +265,18 @@ class ThermalApp(QMainWindow):
         btn_add_cond = QPushButton("➕ 添加工况")
         btn_add_cond.clicked.connect(self.add_condition)
         lyt_cond_tools.addWidget(btn_add_cond)
+        btn_delete_selected = QPushButton("删除选中工况")
+        btn_delete_selected.setObjectName("btn_danger")
+        btn_delete_selected.setToolTip("按 Ctrl 或 Shift 选择多行，再点击删除")
+        btn_delete_selected.clicked.connect(self.delete_selected_conditions)
+        lyt_cond_tools.addWidget(btn_delete_selected)
         lyt_cond_tools.addStretch()
         lyt_cond.addLayout(lyt_cond_tools)
 
         self.table_conds = QTableWidget(0, 6)
         self.table_conds.setEditTriggers(QTableWidget.AllEditTriggers)
+        self.table_conds.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table_conds.setSelectionMode(QTableWidget.ExtendedSelection)
         self.table_conds.setHorizontalHeaderLabels(["启用", "状态", "工况名(表头)", "CSV 路径", "Power-Z 截图", "操作"])
         self.table_conds.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table_conds.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -605,6 +612,17 @@ class ThermalApp(QMainWindow):
             event.accept()
 
     def delete_condition(self, condition_id):
+        self.delete_conditions([condition_id])
+
+    def delete_selected_conditions(self):
+        rows = sorted({index.row() for index in self.table_conds.selectedIndexes()})
+        ids = [self.table_conds.item(row, 2).data(Qt.UserRole) for row in rows]
+        if not ids:
+            QMessageBox.information(self, '未选择工况', '请先按 Ctrl 或 Shift 选择要删除的工况行。')
+            return
+        self.delete_conditions(ids)
+
+    def delete_conditions(self, condition_ids):
         if self._operation_running():
             QMessageBox.warning(self, '正在处理', '请等待当前报告操作完成后再删除工况。')
             return
@@ -612,22 +630,23 @@ class ThermalApp(QMainWindow):
         if not config:
             QMessageBox.warning(self, '无法删除', '请先新建或选择工程。')
             return
-        condition = next((c for c in config['conditions'] if c['id'] == condition_id), None)
-        if condition is None:
+        conditions = [c for c in config['conditions'] if c['id'] in condition_ids]
+        if len(conditions) != len(set(condition_ids)):
             return
+        names = '、'.join(c['name'] for c in conditions)
         reply = QMessageBox.question(
             self, '确认删除工况',
-            f"确定删除工况【{condition['name']}】吗？\n\n"
-            '将同时删除该工况的附表和总表数据，剩余工况向左排列。\n'
+            f"确定删除选中的 {len(conditions)} 个工况【{names}】吗？\n\n"
+            '将同时删除对应附表和总表数据，剩余工况向左排列。\n'
             '工程报告、其他工况及原始 CSV/图片文件会保留。',
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
         config_path = os.path.join(self.cfg_dir, f'{self.cbo_projects.currentText()}.json')
         self.centralWidget().setEnabled(False)
-        self.log(f"正在删除工况：{condition['name']}")
+        self.log(f"正在删除工况：{names}")
         self.delete_worker = DeleteConditionThread(
-            self.current_project_excel, condition, config, config_path)
+            self.current_project_excel, conditions, config, config_path)
         self.delete_worker.log_updated.connect(self.log)
         self.delete_worker.succeeded.connect(self.on_condition_deleted)
         self.delete_worker.failed.connect(self.on_condition_delete_error)
