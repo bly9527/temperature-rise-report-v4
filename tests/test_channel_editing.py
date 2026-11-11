@@ -68,6 +68,93 @@ class ChannelEditingTests(unittest.TestCase):
         self.assertEqual(saved['conditions'][0]['name'], '无线充电')
         self.assertEqual(saved['conditions'][0]['id'], 'existing')
 
+    def click_save(self):
+        button = next(b for b in self.window.findChildren(gui.QPushButton)
+                      if '保存当前配置' in b.text())
+        QTest.mouseClick(button, Qt.LeftButton)
+
+    def test_save_button_recreates_missing_config_folder(self):
+        config_dir = self.config_path.parent
+        config_dir.rename(config_dir.with_name('moved_configs'))
+        self.click_save()
+        saved = json.loads(self.config_path.read_text(encoding='utf-8'))
+        self.assertEqual(saved['conditions'][0]['id'], 'existing')
+
+    def test_save_failure_preserves_existing_config(self):
+        original = self.config_path.read_bytes()
+        self.window.table_conds.item(0, 2).setText('新的工况名')
+        with patch.object(gui.os, 'replace', side_effect=PermissionError('locked')):
+            with patch.object(gui.QMessageBox, 'warning') as warning:
+                self.click_save()
+        warning.assert_called_once()
+        self.assertEqual(self.config_path.read_bytes(), original)
+        self.assertEqual(list(self.config_path.parent.iterdir()), [self.config_path])
+
+    def save_preset(self, name='通用布点'):
+        with patch.object(gui.QInputDialog, 'getText', return_value=(name, True)):
+            self.window.save_channel_preset()
+
+    def test_channel_preset_survives_restart_and_applies_to_new_project(self):
+        channels = [
+            {'hardware_name': '304 (℃)', 'enabled': True, 'custom_name': '板端NTC', 'limit': '65'},
+            {'hardware_name': '320 (℃)', 'enabled': False, 'custom_name': '环境', 'limit': ''},
+        ]
+        self.window.apply_channel_config(channels)
+        self.save_preset('通道/布点方案')
+        presets = self.window.read_channel_presets()
+        self.assertEqual(len(presets), 1)
+        self.assertEqual(presets[0][1]['channels'], channels)
+        target = self.config_path.with_name('new.json')
+        target.write_text(json.dumps({'project_excel': 'new_report.xlsx', 'conditions': [
+            {'id': 'new', 'name': '新工况', 'csv': 'new.csv', 'powerz': 'power.png', 'status': '待生成'}
+        ], 'channels': [{'hardware_name': '101 (℃)', 'enabled': True,
+                         'custom_name': '旧通道', 'limit': '30'}]}), encoding='utf-8')
+        with patch.object(gui, 'get_base_dir', return_value=self.directory.name):
+            reopened = gui.ThermalApp()
+        try:
+            reopened.cbo_projects.setCurrentText('new')
+            before = reopened.collect_project_config()
+            with patch.object(gui.QInputDialog, 'getItem', return_value=('通道/布点方案', True)):
+                with patch.object(gui.QMessageBox, 'question', return_value=gui.QMessageBox.Yes):
+                    reopened.apply_channel_preset()
+            saved = json.loads(target.read_text(encoding='utf-8'))
+            self.assertEqual(saved['channels'], channels)
+            for key in before.keys() - {'channels'}:
+                self.assertEqual(saved[key], before[key])
+            reopened.on_project_changed()
+            self.assertEqual(reopened.collect_channel_config(), channels)
+        finally:
+            reopened.close()
+
+    def test_preset_overwrite_cancel_and_write_failure_preserve_saved_file(self):
+        self.save_preset()
+        path = Path(self.window.read_channel_presets()[0][0])
+        original = path.read_bytes()
+        self.window.table_channels.item(0, 1).setText('更改')
+        with patch.object(gui.QMessageBox, 'question', return_value=gui.QMessageBox.No):
+            self.save_preset()
+        self.assertEqual(path.read_bytes(), original)
+        with patch.object(gui.QMessageBox, 'question', return_value=gui.QMessageBox.Yes):
+            with patch.object(gui.os, 'replace', side_effect=PermissionError('locked')):
+                with patch.object(gui.QMessageBox, 'warning') as warning:
+                    self.save_preset()
+        warning.assert_called_once()
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_invalid_preset_does_not_partially_apply_channels(self):
+        self.save_preset()
+        path = Path(self.window.read_channel_presets()[0][0])
+        value = json.loads(path.read_text(encoding='utf-8'))
+        value['channels'] = [{'hardware_name': '999 (℃)', 'enabled': True,
+                              'custom_name': '错误', 'limit': ''}]
+        path.write_text(json.dumps(value), encoding='utf-8')
+        before = self.window.collect_project_config()
+        with patch.object(gui.QMessageBox, 'warning') as warning:
+            self.window.apply_channel_preset()
+        warning.assert_called_once()
+        self.assertEqual(self.window.collect_project_config(), before)
+
     def test_checkbox_still_toggles_without_editing_label(self):
         table = self.window.table_channels
         checkbox = table.cellWidget(0, 0).findChild(gui.QCheckBox)

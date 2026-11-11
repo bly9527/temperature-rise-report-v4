@@ -5,6 +5,7 @@ build/
 dist/
 release/
 configs/
+channel_presets/
 test_outputs/
 *.log
 *.csv

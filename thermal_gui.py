@@ -4,7 +4,9 @@ import sys
 import json
 import subprocess
 import shutil
+import tempfile
 import uuid
+from contextlib import suppress
 import PyQt5
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -31,6 +33,23 @@ def get_base_dir():
         return os.path.dirname(sys.executable)
     else:
         return os.path.abspath(os.path.dirname(__file__))
+
+
+def write_json_atomic(path, value):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    staged_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=directory,
+                                         suffix='.tmp', delete=False) as stream:
+            staged_path = stream.name
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+        os.replace(staged_path, path)
+        staged_path = None
+    finally:
+        if staged_path is not None:
+            with suppress(OSError):
+                os.remove(staged_path)
 
 QSS_STYLE = """
 QWidget {
@@ -188,6 +207,12 @@ class ThermalApp(QMainWindow):
 
         # 通道工具栏（新增一键清空）
         lyt_ch_tools = QHBoxLayout()
+        btn_save_channels = QPushButton("保存通道配置")
+        btn_save_channels.clicked.connect(self.save_channel_preset)
+        lyt_ch_tools.addWidget(btn_save_channels)
+        btn_apply_channels = QPushButton("套用通道配置")
+        btn_apply_channels.clicked.connect(self.apply_channel_preset)
+        lyt_ch_tools.addWidget(btn_apply_channels)
         btn_clear_channels = QPushButton("🗑️ 一键清空通道")
         btn_clear_channels.setObjectName("btn_danger")
         btn_clear_channels.clicked.connect(self.clear_channels)
@@ -396,22 +421,7 @@ class ThermalApp(QMainWindow):
         self.deleted_image_records = cfg.get('deleted_image_records', [])
         self.log(f"已切换到工程：{proj_name}")
 
-        # 恢复通道
-        channels = cfg.get("channels", [])
-        for r in range(self.table_channels.rowCount()):
-            w = self.table_channels.cellWidget(r, 0)
-            chk = w.findChild(QCheckBox)
-            h_name = chk.text()
-
-            matched = next((c for c in channels if c.get("hardware_name") == h_name), None)
-            if matched:
-                chk.setChecked(matched.get("enabled", False))
-                self.table_channels.setItem(r, 1, QTableWidgetItem(matched.get("custom_name", "")))
-                self.table_channels.setItem(r, 2, QTableWidgetItem(matched.get("limit", "")))
-            else:
-                chk.setChecked(False)
-                self.table_channels.setItem(r, 1, QTableWidgetItem(""))
-                self.table_channels.setItem(r, 2, QTableWidgetItem(""))
+        self.apply_channel_config(cfg.get('channels', []))
 
         # 恢复固定图片（兼容旧版与新版，带状态）
         fimgs = cfg.get("fixed_images", [])
@@ -445,6 +455,107 @@ class ThermalApp(QMainWindow):
                 c.get("status", "待生成"),
                 c.get('id')
             )
+
+    def apply_channel_config(self, channels):
+        for r in range(self.table_channels.rowCount()):
+            w = self.table_channels.cellWidget(r, 0)
+            chk = w.findChild(QCheckBox)
+            h_name = chk.text()
+
+            matched = next((c for c in channels if c.get("hardware_name") == h_name), None)
+            if matched:
+                chk.setChecked(matched.get("enabled", False))
+                self.table_channels.setItem(r, 1, QTableWidgetItem(matched.get("custom_name", "")))
+                self.table_channels.setItem(r, 2, QTableWidgetItem(matched.get("limit", "")))
+            else:
+                chk.setChecked(False)
+                self.table_channels.setItem(r, 1, QTableWidgetItem(""))
+                self.table_channels.setItem(r, 2, QTableWidgetItem(""))
+
+    def read_channel_presets(self):
+        directory = os.path.join(self.base_dir, 'channel_presets')
+        if not os.path.isdir(directory):
+            return []
+        hardware = {self.table_channels.cellWidget(r, 0).findChild(QCheckBox).text()
+                    for r in range(self.table_channels.rowCount())}
+        presets = []
+        names = set()
+        for filename in sorted(os.listdir(directory)):
+            if not filename.endswith('.json'):
+                continue
+            path = os.path.join(directory, filename)
+            with open(path, encoding='utf-8') as stream:
+                value = json.load(stream)
+            if not isinstance(value, dict) or value.get('format') != 'thermal-channels-v1':
+                raise ValueError(f'无法读取通道存档 {filename}，请检查文件格式。')
+            name, channels = value.get('name'), value.get('channels')
+            if (not isinstance(name, str) or not name.strip() or name.casefold() in names
+                    or not isinstance(channels, list) or len(channels) > 60):
+                raise ValueError(f'通道存档 {filename} 的名称或通道列表无效。')
+            used = set()
+            for channel in channels:
+                if (not isinstance(channel, dict)
+                        or not isinstance(channel.get('hardware_name'), str)
+                        or channel['hardware_name'] not in hardware
+                        or channel['hardware_name'] in used
+                        or not isinstance(channel.get('enabled'), bool)
+                        or not isinstance(channel.get('custom_name'), str)
+                        or not isinstance(channel.get('limit'), str)):
+                    raise ValueError(f'通道存档 {filename} 的通道内容无效。')
+                used.add(channel['hardware_name'])
+            names.add(name.casefold())
+            presets.append((path, value))
+        return sorted(presets, key=lambda item: item[1]['name'].casefold())
+
+    def save_channel_preset(self):
+        name, ok = QInputDialog.getText(self, '保存通道配置', '请输入存档名称：',
+                                       text=self.cbo_projects.currentText())
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        try:
+            presets = self.read_channel_presets()
+            path = next((path for path, value in presets
+                         if value['name'].casefold() == name.casefold()), None)
+            if path is not None:
+                if QMessageBox.question(self, '覆盖通道配置', f'已存在【{name}】，确定覆盖吗？',
+                                        QMessageBox.Yes | QMessageBox.No,
+                                        QMessageBox.No) != QMessageBox.Yes:
+                    return
+            else:
+                path = os.path.join(self.base_dir, 'channel_presets', uuid.uuid4().hex + '.json')
+            write_json_atomic(path, {'format': 'thermal-channels-v1', 'name': name,
+                                     'channels': self.collect_channel_config()})
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, '保存失败', f'通道配置保存失败：{error}')
+            return
+        self.log(f'已保存通道配置【{name}】，新建工程后可点击“套用通道配置”。')
+
+    def apply_channel_preset(self):
+        if not self.cbo_projects.currentText():
+            QMessageBox.information(self, '请选择工程', '请先新建或选择工程，再套用通道配置。')
+            return
+        try:
+            presets = self.read_channel_presets()
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, '读取失败', f'通道配置读取失败：{error}')
+            return
+        if not presets:
+            QMessageBox.information(self, '暂无通道配置', '请先在配置好的工程中点击“保存通道配置”。')
+            return
+        names = [value['name'] for _, value in presets]
+        name, ok = QInputDialog.getItem(self, '套用通道配置', '选择已保存的通道配置：',
+                                       names, 0, False)
+        if not ok:
+            return
+        if QMessageBox.question(self, '确认套用',
+                                f'套用【{name}】将替换当前工程的通道勾选、名称和限值，并保存工程配置。确定继续吗？',
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        preset = next(value for _, value in presets if value['name'] == name)
+        self.apply_channel_config(preset['channels'])
+        if self.save_project_config() is not None:
+            self.log(f'已套用通道配置【{name}】并保存到当前工程。')
 
     def clear_channels(self):
         reply = QMessageBox.question(
@@ -666,6 +777,17 @@ class ThermalApp(QMainWindow):
         fpath, _ = QFileDialog.getOpenFileName(self, "选择文件", "", filter_str)
         if fpath: line_edit.setText(fpath)
 
+    def collect_channel_config(self):
+        channels = []
+        for row in range(self.table_channels.rowCount()):
+            checkbox = self.table_channels.cellWidget(row, 0).findChild(QCheckBox)
+            name = self.table_channels.item(row, 1).text()
+            limit = self.table_channels.item(row, 2).text()
+            if checkbox.isChecked() or name or limit:
+                channels.append({'hardware_name': checkbox.text(), 'enabled': checkbox.isChecked(),
+                                 'custom_name': name, 'limit': limit})
+        return channels
+
     def collect_project_config(self):
         proj_name = self.cbo_projects.currentText()
         if not proj_name: return
@@ -674,15 +796,7 @@ class ThermalApp(QMainWindow):
                'deleted_image_ids': self.pending_image_deletions,
                'deleted_image_records': self.deleted_image_records}
 
-        for r in range(self.table_channels.rowCount()):
-            w = self.table_channels.cellWidget(r, 0)
-            chk = w.findChild(QCheckBox) if w else None
-            h_name = chk.text() if chk else ""
-            enabled = chk.isChecked() if chk else False
-            c_name = self.table_channels.item(r, 1).text() if self.table_channels.item(r, 1) else ""
-            limit = self.table_channels.item(r, 2).text() if self.table_channels.item(r, 2) else ""
-            if enabled or c_name or limit:
-                cfg["channels"].append({"hardware_name": h_name, "enabled": enabled, "custom_name": c_name, "limit": limit})
+        cfg['channels'] = self.collect_channel_config()
 
         # 保存固定图片列表（路径 + 勾选状态 + 插入状态）
         for r in range(self.table_fixed_imgs.rowCount()):
@@ -723,9 +837,14 @@ class ThermalApp(QMainWindow):
         if cfg is None:
             return
         cfg_path = os.path.join(self.cfg_dir, f"{self.cbo_projects.currentText()}.json")
-        with open(cfg_path, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-        self.log(f"已保存当前配置。")
+        try:
+            write_json_atomic(cfg_path, cfg)
+        except OSError:
+            message = f'无法保存到 {cfg_path}。请检查目录写入权限，或关闭占用存档的程序后重试。'
+            self.log(f'保存失败：{message}')
+            QMessageBox.warning(self, '保存失败', message)
+            return
+        self.log('已保存当前配置。')
         return cfg
 
     def open_current_excel(self):
@@ -765,6 +884,8 @@ class ThermalApp(QMainWindow):
                 return
 
         project_config = self.save_project_config()
+        if project_config is None:
+            return
 
         # 2. 收集通道配置
         channels_config = []
@@ -868,8 +989,8 @@ class ThermalApp(QMainWindow):
                     font.setBold(True)
                     st_item.setFont(font)
 
-        self.save_project_config()
-        QMessageBox.information(self, "完成", "批量制作成功！已为您自动标记已插入项目并更新界面。即将打开报告。")
+        if self.save_project_config() is not None:
+            QMessageBox.information(self, "完成", "批量制作成功！已为您自动标记已插入项目并更新界面。即将打开报告。")
         self.open_current_excel()
 
     def on_process_error(self, err_msg):
