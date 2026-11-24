@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFileDialog, 
                              QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
                              QPushButton, QVBoxLayout)
 from thermal_phases import clock_text, image_digest, parse_elapsed, phase_text
-from powerz_db import analyze_meter
+from powerz_db import POWERZ_DB_FILTER, bind_meter, switch_to_picture
 
 
 def curve_steps(image, x0, x1, x, y):
@@ -47,7 +47,7 @@ class PhaseEditor(QDialog):
         self.setWindowTitle('功率阶段与降档标记')
         self.digest = image_digest(picture)
         self.picture = picture
-        if settings and settings.get('image_hash') == self.digest:
+        if settings.get('db_path') or settings.get('image_hash') == self.digest:
             self.settings = dict(settings)
         else:
             self.settings = {}
@@ -114,21 +114,19 @@ class PhaseEditor(QDialog):
     def choose_db(self):
         start = self.settings.get('db_path') or self.picture or ''
         path, _ = QFileDialog.getOpenFileName(self,'选择本工况的曲线数据库',
-                                              str(Path(start).parent),'Power-Z (*.db *.sqlite *.sqlite3)')
+                                              str(Path(start).parent), POWERZ_DB_FILTER)
         if path:
             self.import_db(Path(path))
 
     def import_db(self, path):
         try:
-            result = analyze_meter(path)
-            digest = image_digest(path)
+            updated, result = bind_meter(path, self.settings)
         except (ValueError,OSError) as error:
             self.message.setText(str(error))
             return
-        if self.settings.get('db_hash') != digest:
-            self.settings.pop('table', None)
-            self.note.clear()
-        self.settings.update(db_path=str(path),db_hash=digest)
+        if updated['db_hash'] != self.settings.get('db_hash'):
+            self.note.setPlainText(phase_text(updated.get('summary', '')))
+        self.settings = updated
         self.events.setPlainText('\n'.join(clock_text(e['seconds'])+' '+e['label'] for e in result['events']))
         self.load.setText(clock_text(result['load_start']))
         self.message.setText(f'已读取 {result["samples"]:,} 个采样，典型间隔 {result["period"]:.3g} 秒，'
@@ -136,11 +134,11 @@ class PhaseEditor(QDialog):
         self.show_db(path)
 
     def use_picture(self):
-        if self.settings.pop('db_path', None):
-            self.settings.pop('db_hash', None)
+        if self.settings.get('db_path'):
             self.events.clear()
             self.load.setText('0:00:00')
-        self.settings['source'] = 'picture'
+            self.note.clear()
+        self.settings = switch_to_picture(self.settings)
         self.source.setText('来源：截图选点')
         self.source.setToolTip('')
         self.events.setReadOnly(False)

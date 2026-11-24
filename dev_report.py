@@ -82,9 +82,10 @@ def place_image(shape, path, left, top, width, height):
 
 
 def format_detail(sheet, summary, column, cond, channels, positions, settings, log):
-    if settings and settings.get('image_hash') != image_digest(cond['powerz']):
-        raise ValueError(f'[{cond["name"]}] 截图已更换，请在“功率阶段 / 降档标记”重新确认。')
     db_path = settings.get('db_path')
+    if (not db_path and (settings.get('events') or settings.get('summary'))
+            and settings.get('image_hash') != image_digest(cond['powerz'])):
+        raise ValueError(f'[{cond["name"]}] 截图已更换，请在“功率阶段 / 降档标记”重新确认。')
     db_data = None
     if db_path:
         if not Path(db_path).is_file():

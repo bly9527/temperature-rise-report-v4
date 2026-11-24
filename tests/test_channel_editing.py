@@ -1,6 +1,8 @@
 import json
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -8,7 +10,7 @@ import thermal_gui as gui
 from PyQt5.QtCore import Qt, QItemSelectionModel
 from PyQt5.QtGui import QInputMethodEvent
 from PyQt5.QtTest import QTest
-from PyQt5.QtWidgets import QLineEdit
+from PyQt5.QtWidgets import QLineEdit, QPushButton
 
 
 class ChannelEditingTests(unittest.TestCase):
@@ -67,6 +69,57 @@ class ChannelEditingTests(unittest.TestCase):
         saved = self.window.save_project_config()
         self.assertEqual(saved['conditions'][0]['name'], '无线充电')
         self.assertEqual(saved['conditions'][0]['id'], 'existing')
+
+    def test_development_db_picker_saves_binding_and_keeps_it_after_bad_input(self):
+        root = Path(self.directory.name)
+        project = root / 'dev_data' / 'configs' / 'test.json'
+        project.parent.mkdir(parents=True)
+        project.write_bytes(self.config_path.read_bytes())
+        path = root / '曲线.db'
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute('CREATE TABLE table_1(Unix, VBUS, IBUS)')
+            db.executemany('INSERT INTO table_1 VALUES (?,?,?)',
+                           [(i, 9, 2 if i < 30 else 1) for i in range(60)])
+        with patch.object(gui, 'get_base_dir', return_value=str(root)):
+            window = gui.ThermalApp(development=True)
+        self.addCleanup(window.close)
+        table = window.table_conds
+        self.assertEqual(table.horizontalHeaderItem(5).text(), 'Power-Z DB')
+        self.assertEqual(self.window.table_conds.horizontalHeaderItem(5).text(), 'Power-Z DB')
+        picker = table.cellWidget(0, 5)
+        choose = picker.findChildren(QPushButton)[0]
+
+        def wait_for_import():
+            for _ in range(200):
+                QTest.qWait(10)
+                if window.centralWidget().isEnabled():
+                    return
+            self.fail('DB 导入未完成')
+
+        with patch.object(gui.QFileDialog, 'getOpenFileName', return_value=(str(path), '')):
+            choose.click()
+            wait_for_import()
+        saved = json.loads(project.read_text(encoding='utf-8'))
+        phases = saved['conditions'][0]['phases']
+        self.assertEqual(phases['db_path'], str(path))
+        self.assertEqual(phases['events'][0]['seconds'], 30.0)
+        self.assertEqual(picker.findChild(QLineEdit).text(), path.name)
+        invalid = root / '无效.db'
+        invalid.write_bytes(b'invalid')
+        with patch.object(gui.QFileDialog, 'getOpenFileName', return_value=(str(invalid), '')), \
+                patch.object(gui.QMessageBox, 'warning') as warning:
+            choose.click()
+            wait_for_import()
+            warning.assert_called_once()
+        self.assertEqual(json.loads(project.read_text(encoding='utf-8')), saved)
+        window.on_project_changed()
+        picker = table.cellWidget(0, 5)
+        self.assertEqual(picker.findChild(QLineEdit).text(), path.name)
+        picker.findChildren(QPushButton)[1].click()
+        settings = json.loads(project.read_text(encoding='utf-8'))['conditions'][0]['phases']
+        self.assertEqual(settings['source'], 'picture')
+        self.assertNotIn('db_path', settings)
+        self.assertNotIn('events', settings)
 
     def click_save(self):
         button = next(b for b in self.window.findChildren(gui.QPushButton)

@@ -5,7 +5,9 @@ from math import isfinite
 from pathlib import Path
 import sqlite3
 from statistics import median
-from thermal_phases import clock_text, parse_elapsed
+from thermal_phases import clock_text, image_digest, parse_elapsed
+
+POWERZ_DB_FILTER = 'Power-Z (*.db *.sqlite *.sqlite3)'
 
 
 def read_trace(path):
@@ -132,3 +134,26 @@ def analyze_meter(path):
         table.append([clock_text(t),label,round(v,4),round(a,4),round(p,4)])
     return {'events':events,'load_start':times[first],'event_table':table,
             'period':period,'samples':len(rows)}
+
+
+def bind_meter(path, settings):
+    """Build the saved DB binding from a readable, unchanged recording."""
+    digest = image_digest(path)
+    analysis = analyze_meter(path)
+    if image_digest(path) != digest:
+        raise ValueError('曲线 DB 正在变化，请保存记录后重新选择。')
+    updated = dict(settings, db_path=str(path), db_hash=digest,
+                   events=analysis['events'], load_start=analysis['load_start'])
+    updated.pop('source', None)
+    if settings.get('db_hash') != digest:
+        for key in ('summary', 'table'):
+            updated.pop(key, None)
+    return updated, analysis
+
+
+def switch_to_picture(settings):
+    updated = dict(settings, source='picture')
+    if updated.pop('db_path', None):
+        for key in ('db_hash', 'events', 'load_start', 'summary', 'table'):
+            updated.pop(key, None)
+    return updated

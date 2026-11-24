@@ -37,7 +37,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='温升报告自动生成器_v4.0',
+    name='ThermalReportGenerator_v4.1.0',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

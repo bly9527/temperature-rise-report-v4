@@ -1078,8 +1078,8 @@ def process_bulk_thermal_data(project_excel, condition_configs, fixed_images,
             _assign_conditions(output_book, summary, state, registry,
                                {item['id'] for item in prepared})
             _write_summary(summary, prepared, channels_config, state)
-            development = project_config.get('development', False)
-            if development:
+            simplified_report = project_config.get('simplified_report', project_config.get('development', False))
+            if simplified_report:
                 from dev_report import configure_summary, format_detail
                 positions = configure_summary(summary, channels_config)
                 phase_settings = {_record_id(c, 'condition'): c.get('phases', {}) for c in registry}
@@ -1089,10 +1089,10 @@ def process_bulk_thermal_data(project_excel, condition_configs, fixed_images,
                                   project_config.get('deleted_image_ids', []),
                                   legacy_hashes, log_callback, expected_hashes)
             for index, cond in enumerate(prepared):
-                first_row = 5 if development else 4
+                first_row = 5 if simplified_report else 4
                 last_row = _write_detail(excel, output_book, reference_sheet,
                                          cond, channels_config, log_callback, first_row)
-                if development:
+                if simplified_report:
                     column = state['conditions'][cond['id']]['column']
                     format_detail(output_book.Worksheets.Item(cond['sheet_name']), summary,
                                   column, cond, channels_config, positions,

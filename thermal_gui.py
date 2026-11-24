@@ -22,6 +22,8 @@ from PyQt5.QtGui import QFont
 from thermal_processor import process_bulk_thermal_data, delete_condition_results
 from thermal_license import Activation
 
+APP_VERSION = '4.1.0'
+
 def configure_qt_plugins():
     # Some Qt5 Windows wheels lose non-ASCII characters in their built-in path.
     # Use Python's Unicode package path when that default directory is invalid.
@@ -143,10 +145,29 @@ class DeleteConditionThread(QThread):
             self.failed.emit(str(error).strip() or '删除失败，请检查报告文件后重试。')
 
 
+class ImportPowerZThread(QThread):
+    succeeded = pyqtSignal(dict, int, int)
+    failed = pyqtSignal(str)
+
+    def __init__(self, path, settings):
+        super().__init__()
+        self.path = path
+        self.settings = settings
+
+    def run(self):
+        try:
+            from powerz_db import bind_meter
+            settings, analysis = bind_meter(self.path, self.settings)
+        except Exception as error:
+            self.failed.emit(str(error).strip() or '无法读取 Power-Z DB。')
+        else:
+            self.succeeded.emit(settings, analysis['samples'], len(analysis['events']))
+
+
 class ThermalApp(QMainWindow):
     def __init__(self, development=False):
         super().__init__()
-        self.setWindowTitle("温升报告自动生成系统 v4.0 - Excel原生折线图（分批更新修复）")
+        self.setWindowTitle(f"温升报告自动生成系统 v{APP_VERSION} - Excel原生折线图")
         self.resize(1300, 900)
         self.setStyleSheet(QSS_STYLE)
 
@@ -301,24 +322,26 @@ class ThermalApp(QMainWindow):
         btn_delete_selected.setToolTip("按 Ctrl 或 Shift 选择多行，再点击删除")
         btn_delete_selected.clicked.connect(self.delete_selected_conditions)
         lyt_cond_tools.addWidget(btn_delete_selected)
-        if self.development:
-            button = QPushButton('功率阶段 / 降档标记')
-            button.clicked.connect(self.edit_phases)
-            lyt_cond_tools.addWidget(button)
+        button = QPushButton('功率阶段 / 降档标记')
+        button.clicked.connect(self.edit_phases)
+        lyt_cond_tools.addWidget(button)
         lyt_cond_tools.addStretch()
         lyt_cond.addLayout(lyt_cond_tools)
 
-        self.table_conds = QTableWidget(0, 6)
+        condition_headers = ["启用", "状态", "工况名(表头)", "CSV 路径", "Power-Z 截图", "Power-Z DB", "操作"]
+        self.table_conds = QTableWidget(0, len(condition_headers))
         self.table_conds.setEditTriggers(QTableWidget.AllEditTriggers)
         self.table_conds.setSelectionBehavior(QTableWidget.SelectRows)
         self.table_conds.setSelectionMode(QTableWidget.ExtendedSelection)
-        self.table_conds.setHorizontalHeaderLabels(["启用", "状态", "工况名(表头)", "CSV 路径", "Power-Z 截图", "操作"])
+        self.table_conds.setHorizontalHeaderLabels(condition_headers)
         self.table_conds.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table_conds.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.table_conds.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.table_conds.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         self.table_conds.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
-        self.table_conds.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.table_conds.horizontalHeader().setSectionResizeMode(5, QHeaderView.Interactive)
+        self.table_conds.setColumnWidth(5, 145)
+        self.table_conds.horizontalHeader().setSectionResizeMode(len(condition_headers) - 1, QHeaderView.ResizeToContents)
         lyt_cond.addWidget(self.table_conds)
         lyt_right.addWidget(group_conditions)
 
@@ -719,12 +742,89 @@ class ThermalApp(QMainWindow):
         # 列4：Power-Z 截图
         self.table_conds.setCellWidget(r, 4, make_path_picker(pz_path, "Image (*.png *.jpg *.bmp)"))
 
-        # 列5：操作
+        db_widget = QWidget()
+        db_layout = QHBoxLayout(db_widget)
+        db_layout.setContentsMargins(0, 0, 0, 0)
+        db_layout.setSpacing(2)
+        filename = QLineEdit()
+        filename.setReadOnly(True)
+        filename.setPlaceholderText('选择 DB')
+        filename.setMinimumWidth(0)
+        db_layout.addWidget(filename, 1)
+        for label, hint, action in [('…', '选择 Power-Z DB', self.pick_condition_db),
+                                    ('×', '清除 Power-Z DB', self.clear_condition_db)]:
+            button = QPushButton(label)
+            button.setToolTip(hint)
+            button.setAccessibleName(hint)
+            button.setFixedWidth(24)
+            button.setStyleSheet('padding: 3px')
+            button.clicked.connect(lambda _, entry=item, callback=action: callback(entry))
+            db_layout.addWidget(button)
+        self.table_conds.setCellWidget(r, 5, db_widget)
+        self.update_condition_db_cell(item)
+
         btn_del = QPushButton("删除")
         btn_del.setObjectName("btn_danger")
         condition_id = item.data(Qt.UserRole)
         btn_del.clicked.connect(lambda _, key=condition_id: self.delete_condition(key))
-        self.table_conds.setCellWidget(r, 5, btn_del)
+        self.table_conds.setCellWidget(r, self.table_conds.columnCount() - 1, btn_del)
+
+    def update_condition_db_cell(self, item):
+        widget = self.table_conds.cellWidget(item.row(), 5)
+        path = (item.data(Qt.UserRole + 1) or {}).get('db_path', '')
+        filename = widget.findChild(QLineEdit)
+        filename.setText(os.path.basename(path))
+        filename.setCursorPosition(0)
+        filename.setToolTip(path)
+
+    def save_condition_phases(self, item, settings):
+        previous = item.data(Qt.UserRole + 1)
+        item.setData(Qt.UserRole + 1, settings)
+        if self.save_project_config() is None:
+            item.setData(Qt.UserRole + 1, previous)
+            return False
+        self.update_condition_db_cell(item)
+        return True
+
+    def pick_condition_db(self, item):
+        from powerz_db import POWERZ_DB_FILTER
+        if self._operation_running():
+            return
+        settings = item.data(Qt.UserRole + 1) or {}
+        picture = self.table_conds.cellWidget(item.row(), 4).findChild(QLineEdit).text()
+        start = settings.get('db_path') or picture or self.current_project_excel
+        path, _ = QFileDialog.getOpenFileName(
+            self, '选择本工况的曲线数据库', os.path.dirname(start), POWERZ_DB_FILTER)
+        if not path:
+            return
+        self.centralWidget().setEnabled(False)
+        self.log(f'[{item.text()}] 正在识别 {os.path.basename(path)} 的功率变化。')
+        self.db_import_item = item
+        self.db_import_worker = ImportPowerZThread(path, settings)
+        self.db_import_worker.succeeded.connect(self.on_db_imported)
+        self.db_import_worker.failed.connect(self.on_db_import_failed)
+        self.db_import_worker.finished.connect(self.on_db_import_finished)
+        self.db_import_worker.start()
+
+    def on_db_imported(self, settings, samples, event_count):
+        item = self.db_import_item
+        if self.save_condition_phases(item, settings):
+            self.log(f'[{item.text()}] 读取 {samples:,} 个采样，识别 {event_count} 个功率变化点。'
+                     '生成此工况时自动匹配测温行并标黄。')
+
+    def on_db_import_failed(self, message):
+        self.log(f'读取 Power-Z DB 失败：{message}')
+        QMessageBox.warning(self, '读取 Power-Z DB 失败', message)
+
+    def on_db_import_finished(self):
+        self.db_import_item = None
+        self.centralWidget().setEnabled(True)
+
+    def clear_condition_db(self, item):
+        from powerz_db import switch_to_picture
+        settings = item.data(Qt.UserRole + 1) or {}
+        if settings.get('db_path') and self.save_condition_phases(item, switch_to_picture(settings)):
+            self.log(f'[{item.text()}] 已清除曲线 DB。仅有截图时可手动设置降档点。')
 
     def edit_phases(self):
         from phase_editor import PhaseEditor
@@ -739,13 +839,13 @@ class ThermalApp(QMainWindow):
             return
         dialog = PhaseEditor(picture, item.data(Qt.UserRole + 1) or {}, self)
         if dialog.exec_() == QDialog.Accepted:
-            item.setData(Qt.UserRole + 1, dialog.settings)
-            self.save_project_config()
+            self.save_condition_phases(item, dialog.settings)
 
     def _operation_running(self):
         return any(worker is not None and worker.isRunning()
                    for worker in (getattr(self, 'worker', None),
-                                  getattr(self, 'delete_worker', None)))
+                                  getattr(self, 'delete_worker', None),
+                                  getattr(self, 'db_import_worker', None)))
 
     def closeEvent(self, event):
         if self._operation_running():
@@ -859,10 +959,9 @@ class ThermalApp(QMainWindow):
                 "csv": csv_path,
                 "powerz": pz_path,
                 "enabled": enabled,
-                "status": status
+                "status": status,
+                "phases": self.table_conds.item(r, 2).data(Qt.UserRole + 1) or {}
             })
-            if self.development:
-                cfg['conditions'][-1]['phases'] = self.table_conds.item(r, 2).data(Qt.UserRole + 1) or {}
 
         return cfg
 
@@ -979,7 +1078,7 @@ class ThermalApp(QMainWindow):
         self.progress_bar.setValue(0)
 
         self.worker = WorkerThread(self.current_project_excel, cond_configs, fixed_images,
-                                   channels_config, dict(project_config, development=self.development))
+                                   channels_config, dict(project_config, simplified_report=True))
         self.worker.progress_updated.connect(self.progress_bar.setValue)
         self.worker.log_updated.connect(self.log)
         self.worker.finished_signal.connect(self.on_process_finished)
