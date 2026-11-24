@@ -6,6 +6,7 @@ import subprocess
 import shutil
 import tempfile
 import uuid
+from datetime import date, timedelta
 from contextlib import suppress
 import PyQt5
 from PyQt5.QtWidgets import (
@@ -13,12 +14,13 @@ from PyQt5.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QComboBox, QFileDialog,
     QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
     QProgressBar, QTextEdit, QGroupBox, QMessageBox, QSplitter,
-    QInputDialog, QListWidget, QListWidgetItem
+    QInputDialog, QListWidget, QListWidgetItem, QDialog
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QLibraryInfo
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QLibraryInfo, QTimer
 from PyQt5.QtGui import QFont
 
 from thermal_processor import process_bulk_thermal_data, delete_condition_results
+from thermal_license import Activation
 
 def configure_qt_plugins():
     # Some Qt5 Windows wheels lose non-ASCII characters in their built-in path.
@@ -142,18 +144,22 @@ class DeleteConditionThread(QThread):
 
 
 class ThermalApp(QMainWindow):
-    def __init__(self):
+    def __init__(self, development=False):
         super().__init__()
         self.setWindowTitle("温升报告自动生成系统 v4.0 - Excel原生折线图（分批更新修复）")
         self.resize(1300, 900)
         self.setStyleSheet(QSS_STYLE)
 
+        self.development = development
         self.base_dir = get_base_dir()
+        resource_dir = getattr(sys, '_MEIPASS', self.base_dir)
+        if development:
+            self.setWindowTitle('【开发版】' + self.windowTitle())
+            self.base_dir = os.path.join(self.base_dir, 'dev_data')
         self.cfg_dir = os.path.join(self.base_dir, "configs")
         os.makedirs(self.cfg_dir, exist_ok=True)
         self.assets_dir = os.path.join(self.base_dir, "assets")
         os.makedirs(self.assets_dir, exist_ok=True)
-        resource_dir = getattr(sys, '_MEIPASS', self.base_dir)
         self.base_template = os.path.join(resource_dir, "assets", "底层模板.xlsx")
 
         self.current_project_excel = ""
@@ -295,6 +301,10 @@ class ThermalApp(QMainWindow):
         btn_delete_selected.setToolTip("按 Ctrl 或 Shift 选择多行，再点击删除")
         btn_delete_selected.clicked.connect(self.delete_selected_conditions)
         lyt_cond_tools.addWidget(btn_delete_selected)
+        if self.development:
+            button = QPushButton('功率阶段 / 降档标记')
+            button.clicked.connect(self.edit_phases)
+            lyt_cond_tools.addWidget(button)
         lyt_cond_tools.addStretch()
         lyt_cond.addLayout(lyt_cond_tools)
 
@@ -359,7 +369,12 @@ class ThermalApp(QMainWindow):
         if not ok or not proj_name.strip(): return
         proj_name = proj_name.strip()
 
-        target_dir = QFileDialog.getExistingDirectory(self, "选择工程存放的文件夹")
+        if self.development:
+            reports_dir = os.path.join(self.base_dir, 'reports')
+            os.makedirs(reports_dir, exist_ok=True)
+            target_dir = QFileDialog.getExistingDirectory(self, "选择开发工程存放的文件夹", reports_dir)
+        else:
+            target_dir = QFileDialog.getExistingDirectory(self, "选择工程存放的文件夹")
         if not target_dir: return
 
         excel_path = os.path.join(target_dir, f"{proj_name}_报告.xlsx")
@@ -453,7 +468,7 @@ class ThermalApp(QMainWindow):
                 c.get("powerz", ""),
                 c.get("enabled", True),
                 c.get("status", "待生成"),
-                c.get('id')
+                c.get('id'), c.get('phases')
             )
 
     def apply_channel_config(self, channels):
@@ -654,7 +669,7 @@ class ThermalApp(QMainWindow):
             self.add_cond_row(cname.strip())
 
     def add_cond_row(self, cname, csv_path="", pz_path="", enabled=True, status="待生成",
-                     record_id=None):
+                     record_id=None, phases=None):
         r = self.table_conds.rowCount()
         self.table_conds.insertRow(r)
 
@@ -684,6 +699,7 @@ class ThermalApp(QMainWindow):
         # 列2：工况名
         item = QTableWidgetItem(cname)
         item.setData(Qt.UserRole, record_id or uuid.uuid4().hex)
+        item.setData(Qt.UserRole + 1, phases or {})
         self.table_conds.setItem(r, 2, item)
 
         # 文件选择器封装
@@ -709,6 +725,22 @@ class ThermalApp(QMainWindow):
         condition_id = item.data(Qt.UserRole)
         btn_del.clicked.connect(lambda _, key=condition_id: self.delete_condition(key))
         self.table_conds.setCellWidget(r, 5, btn_del)
+
+    def edit_phases(self):
+        from phase_editor import PhaseEditor
+        row = self.table_conds.currentRow()
+        if row < 0:
+            QMessageBox.information(self, '选择工况', '请先点击要配置的工况。')
+            return
+        item = self.table_conds.item(row, 2)
+        picture = self.table_conds.cellWidget(row, 4).findChild(QLineEdit).text()
+        if picture and not os.path.isfile(picture):
+            QMessageBox.warning(self, '截图路径', '请重新选择可读取的 Power-Z 截图。')
+            return
+        dialog = PhaseEditor(picture, item.data(Qt.UserRole + 1) or {}, self)
+        if dialog.exec_() == QDialog.Accepted:
+            item.setData(Qt.UserRole + 1, dialog.settings)
+            self.save_project_config()
 
     def _operation_running(self):
         return any(worker is not None and worker.isRunning()
@@ -829,6 +861,8 @@ class ThermalApp(QMainWindow):
                 "enabled": enabled,
                 "status": status
             })
+            if self.development:
+                cfg['conditions'][-1]['phases'] = self.table_conds.item(r, 2).data(Qt.UserRole + 1) or {}
 
         return cfg
 
@@ -945,7 +979,7 @@ class ThermalApp(QMainWindow):
         self.progress_bar.setValue(0)
 
         self.worker = WorkerThread(self.current_project_excel, cond_configs, fixed_images,
-                                   channels_config, project_config)
+                                   channels_config, dict(project_config, development=self.development))
         self.worker.progress_updated.connect(self.progress_bar.setValue)
         self.worker.log_updated.connect(self.log)
         self.worker.finished_signal.connect(self.on_process_finished)
@@ -999,9 +1033,104 @@ class ThermalApp(QMainWindow):
         self.log(f"执行失败: {err_msg}")
         QMessageBox.critical(self, "生成失败", err_msg)
 
-if __name__ == "__main__":
+def authorize(activation):
+    message = ''
+    try:
+        activation.load()
+        if activation.card:
+            return activation.accept(activation.card, date.today())
+    except ValueError as error:
+        message = str(error)
+    except OSError:
+        message = '无法读写本机授权记录，请检查当前用户目录的权限。'
+
+    dialog = QDialog()
+    dialog.setWindowTitle('温升报告生成器 · 卡密激活')
+    dialog.setMinimumWidth(430)
+    layout = QVBoxLayout(dialog)
+    layout.setContentsMargins(20, 20, 20, 20)
+    layout.addWidget(QLabel('将本机机器码发给签发人，获取两个月卡密。'))
+    row = QHBoxLayout()
+    machine = QLineEdit(activation.machine)
+    machine.setReadOnly(True)
+    machine.setAccessibleName('本机机器码')
+    copy = QPushButton('复制机器码')
+    copy.clicked.connect(lambda: QApplication.clipboard().setText(activation.machine))
+    row.addWidget(machine)
+    row.addWidget(copy)
+    layout.addLayout(row)
+    entry = QLineEdit()
+    entry.setPlaceholderText('粘贴本机卡密')
+    entry.setAccessibleName('卡密')
+    layout.addWidget(entry)
+    status = QLabel(message)
+    status.setStyleSheet('color: #a12b20')
+    layout.addWidget(status)
+    buttons = QHBoxLayout()
+    buttons.addStretch()
+    cancel = QPushButton('退出')
+    cancel.clicked.connect(dialog.reject)
+    enter = QPushButton('激活并进入')
+    enter.setStyleSheet('background: #0057d2; color: white; padding: 6px 14px')
+    enter.setDefault(True)
+    buttons.addWidget(cancel)
+    buttons.addWidget(enter)
+    layout.addLayout(buttons)
+    expiry = None
+
+    def submit():
+        nonlocal expiry
+        try:
+            expiry = activation.accept(entry.text(), date.today())
+        except ValueError as error:
+            status.setText(str(error))
+        except OSError:
+            status.setText('无法保存卡密，请检查当前用户目录的权限后重试。')
+        else:
+            dialog.accept()
+
+    enter.clicked.connect(submit)
+    entry.setFocus()
+    return expiry if dialog.exec_() == QDialog.Accepted else None
+
+
+def main():
     configure_qt_plugins()
     app = QApplication(sys.argv)
-    window = ThermalApp()
+    try:
+        activation = Activation.current_user()
+    except (OSError, ValueError, KeyError):
+        QMessageBox.critical(None, '授权失败', '无法读取本机授权信息，请检查 Windows 用户环境。')
+        return 1
+    expiry = authorize(activation)
+    if expiry is None:
+        return 0
+    window = ThermalApp(development='--dev' in sys.argv[1:])
+    title = window.windowTitle()
+
+    def show_expiry(end):
+        window.setWindowTitle(f'{title}  ·  可用至 {end - timedelta(days=1)}')
+
+    show_expiry(expiry)
+    timer = QTimer(window)
+
+    def check_date():
+        if date.today() == activation.last_seen or window._operation_running():
+            return
+        timer.stop()
+        end = authorize(activation)
+        if end is None:
+            window.close()
+        else:
+            show_expiry(end)
+            timer.start()
+
+    timer.setInterval(1000)
+    timer.timeout.connect(check_date)
+    timer.start()
     window.show()
-    sys.exit(app.exec_())
+    return app.exec_()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

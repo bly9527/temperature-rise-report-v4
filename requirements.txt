@@ -1,3 +1,5 @@
 PyQt5
 openpyxl
 pywin32
+cryptography>=40
+Pillow>=9.2

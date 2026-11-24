@@ -6,6 +6,7 @@ dist/
 release/
 configs/
 channel_presets/
+dev_data/
 test_outputs/
 *.log
 *.csv

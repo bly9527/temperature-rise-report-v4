@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from thermal_processor import (
     _condition_result_to_delete, _compact_condition_columns,
-    _commit_condition_deletion, _validate_condition_positions,
+    _commit_condition_deletion, _load_report_state, _validate_condition_positions,
 )
 
 
@@ -29,6 +29,17 @@ class Summary:
             def Copy(self, target):
                 values = [summary.values.get(p) for p in self.coordinates]
                 for p, value in zip(target.coordinates, values):
+                    if isinstance(value, str) and value.startswith('='):
+                        value = '#reference shifted by Copy'
+                    summary.values[p] = value
+
+            @property
+            def Formula(self):
+                return tuple((summary.values.get(p),) for p in self.coordinates)
+
+            @Formula.setter
+            def Formula(self, formulas):
+                for p, (value,) in zip(self.coordinates, formulas):
                     summary.values[p] = value
 
             def ClearContents(self):
@@ -38,6 +49,19 @@ class Summary:
 
 
 class DeletionTests(unittest.TestCase):
+    def test_legacy_excel_numeric_state_keys_are_loaded_as_text(self):
+        values = {(1, 1): 'thermal-state-v1'}
+        for row, key in enumerate((0.0, 18.0, '00042'), 2):
+            values[(row, 1)] = 'conditions'
+            values[(row, 2)] = key
+            values[(row, 3)] = json.dumps({'column': row + 2})
+        sheet = Summary(values)
+        sheet.Name = '_ThermalState'
+        sheet.UsedRange = SimpleNamespace(Rows=SimpleNamespace(Count=4))
+        report = SimpleNamespace(Worksheets=[sheet])
+        self.assertEqual(_load_report_state(report)['conditions'],
+                         {'0': {'column': 4}, '18': {'column': 5}, '00042': {'column': 6}})
+
     def test_compaction_preserves_unmanaged_results_and_protected_areas(self):
         summary = Summary({(4, 4): 'A', (5, 4): 20, (4, 6): 'B', (5, 6): 30,
                            (4, 9): 'manual', (5, 9): 40,
@@ -51,6 +75,15 @@ class DeletionTests(unittest.TestCase):
         self.assertEqual(summary.Cells(5, 16).Value, 'spec')
         self.assertEqual(summary.Cells(5, 17).Value, 'pass')
         self.assertEqual(summary.Cells(30, 4).Value, 'photo')
+
+    def test_development_compaction_keeps_old_peak_formula_and_phase_description(self):
+        summary = Summary({(28, 1): '功率阶段', (4, 6): 'B', (5, 6): '=B!C2',
+                           (28, 6): '9V / 1A'})
+        state = {'conditions': {'b': {'column': 6}}}
+        _compact_condition_columns(summary, state)
+        self.assertEqual(summary.Cells(5, 4).Value, '=B!C2')
+        self.assertEqual(summary.Cells(28, 4).Value, '9V / 1A')
+        self.assertIsNone(summary.Cells(28, 6).Value)
 
     def test_delete_is_by_id_even_when_ui_name_was_edited(self):
         record = {'name': 'old', 'column': 5, 'sheet': 'old (1)'}

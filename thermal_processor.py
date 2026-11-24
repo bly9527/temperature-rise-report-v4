@@ -14,10 +14,13 @@ import zipfile
 import posixpath
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from functools import wraps
+from contextlib import suppress
 
 import openpyxl
 from openpyxl.utils import get_column_letter
-from openpyxl.utils.datetime import to_excel
+from openpyxl.utils.datetime import from_excel, to_excel
+from powerz_title import write_titled_powerz
 
 
 CHANNEL_HEADER_RE = re.compile(r'^\s*(\d{3})\s*\(')
@@ -30,6 +33,46 @@ EXCEL_PASTE_FORMATS = -4122
 EXCEL_PICTURE = 13
 EXCEL_MOVE_AND_SIZE = 1
 STATE_SHEET = '_ThermalState'
+SUMMARY_NAMES = ('总表', '温升测试')
+
+
+def _exclusive_report_operation(operation):
+    @wraps(operation)
+    def run(project_excel, *args, **kwargs):
+        import win32api
+        import win32event
+
+        path = os.path.normcase(os.path.realpath(project_excel))
+        key = hashlib.sha256(path.encode('utf-8')).hexdigest()
+        mutex = win32event.CreateMutex(None, False, f'Local\\ThermalReport_{key}')
+        acquired = False
+        try:
+            state = win32event.WaitForSingleObject(mutex, 0)
+            acquired = state in (win32event.WAIT_OBJECT_0, win32event.WAIT_ABANDONED)
+            if not acquired:
+                raise ValueError('此报告正在另一个窗口生成或删除工况，请完成后再试。')
+            return operation(project_excel, *args, **kwargs)
+        finally:
+            if acquired:
+                win32event.ReleaseMutex(mutex)
+            win32api.CloseHandle(mutex)
+    return run
+
+
+def _report_digest(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.digest()
+
+
+def _get_summary_sheet(workbook):
+    for name in SUMMARY_NAMES:
+        for sheet in workbook.Worksheets:
+            if sheet.Name == name:
+                return sheet
+    raise ValueError('报告缺少“总表”或“温升测试”工作表。')
 
 
 def _record_id(record, kind):
@@ -49,8 +92,11 @@ def _load_report_state(workbook):
             raise ValueError('报告中的工况记录格式无法识别，请使用报告备份')
         for row in range(2, sheet.UsedRange.Rows.Count + 1):
             kind, key, value = (sheet.Cells(row, col).Value for col in (1, 2, 3))
-            if kind in state and key and value:
-                state[kind][key] = json.loads(value)
+            if kind in state and key is not None and key != '' and value:
+                # Excel converted numeric-looking IDs in older state sheets.
+                if isinstance(key, float) and key.is_integer():
+                    key = int(key)
+                state[kind][str(key)] = json.loads(value)
         break
     return state
 
@@ -62,6 +108,7 @@ def _save_report_state(workbook, state):
         sheet.Name = STATE_SHEET
     sheet.Cells.ClearContents()
     sheet.Cells(1, 1).Value = 'thermal-state-v1'
+    sheet.Columns(2).NumberFormat = '@'
     row = 2
     for kind, records in state.items():
         for key, record in records.items():
@@ -377,12 +424,13 @@ def _validate_condition_positions(state):
     sheets = [record['sheet'].casefold() for record in records]
     if (len(columns) != len(set(columns)) or any(c < 4 or c > 15 for c in columns)
             or len(sheets) != len(set(sheets))
-            or any(s in ('总表', STATE_SHEET.casefold()) for s in sheets)):
+            or any(s in (*SUMMARY_NAMES, STATE_SHEET.casefold()) for s in sheets)):
         raise ValueError('报告工况位置记录异常，请先核对报告；原报告未修改')
 
 
 def _compact_condition_columns(summary, state):
     """Move only the condition cells, leaving specification columns and photos alone."""
+    bottom = 28 if summary.Cells(28, 1).Value in ('功率阶段', '采集及功率阶段') else 27
     occupied = {int(r['column']) for r in state['conditions'].values()}
     occupied.update(col for col in range(4, 16)
                     if any(summary.Cells(row, col).Value is not None
@@ -391,9 +439,13 @@ def _compact_condition_columns(summary, state):
     for source, target in moves.items():
         if source == target:
             continue
-        old = summary.Range(summary.Cells(4, source), summary.Cells(27, source))
-        new = summary.Range(summary.Cells(4, target), summary.Cells(27, target))
+        old = summary.Range(summary.Cells(4, source), summary.Cells(bottom, source))
+        new = summary.Range(summary.Cells(4, target), summary.Cells(bottom, target))
         old.Copy(new)
+        if bottom == 28:
+            # Development summary formulas point to fixed measurement columns
+            # on other sheets. Copy shifts those references along with the cell.
+            new.Formula = old.Formula
         old.ClearContents()
     for record in state['conditions'].values():
         record['column'] = moves[int(record['column'])]
@@ -402,7 +454,13 @@ def _compact_condition_columns(summary, state):
 def _order_condition_sheets(workbook, summary, state):
     sheets = {s.Name.casefold(): s for s in workbook.Worksheets}
     previous = summary
-    for record in sorted(state['conditions'].values(), key=lambda r: int(r['column'])):
+
+    def order(record):
+        match = re.search(r'放电|充电', record['name']) if summary.Name == '温升测试' else None
+        group = {'充电': 0, '放电': 1}.get(match.group() if match else '', 2)
+        return group, int(record['column'])
+
+    for record in sorted(state['conditions'].values(), key=order):
         sheet = sheets.get(record['sheet'].casefold())
         if sheet is not None:
             if sheet.Index != previous.Index + 1:
@@ -487,6 +545,7 @@ def delete_condition_result(project_excel, condition, project_config, config_pat
                                     config_path, log_callback)
 
 
+@_exclusive_report_operation
 def delete_condition_results(project_excel, conditions, project_config, config_path,
                              log_callback=None):
     """Remove selected results and persist the report and config together."""
@@ -494,8 +553,7 @@ def delete_condition_results(project_excel, conditions, project_config, config_p
     report_path = os.path.abspath(project_excel)
     if not os.path.isfile(report_path):
         raise FileNotFoundError('工程报告不存在，请先核对报告路径；未删除工况。')
-    with open(report_path, 'rb') as stream:
-        original_hash = hashlib.sha256(stream.read()).digest()
+    original_hash = _report_digest(report_path)
     registry = project_config.get('conditions', [])
     keys = [_record_id(c, 'condition') for c in conditions]
     if not keys or len(keys) != len(set(keys)) or any(
@@ -522,7 +580,7 @@ def delete_condition_results(project_excel, conditions, project_config, config_p
             book = excel.Workbooks.Open(work_path, 0, False)
             if book.ReadOnly:
                 raise PermissionError('报告无法编辑，请关闭 Excel/WPS 中的报告后重试。')
-            summary = book.Worksheets.Item('总表')
+            summary = _get_summary_sheet(book)
             state = _load_report_state(book)
             _validate_condition_positions(state)
             targets = [_condition_result_to_delete(summary, state, condition, registry)
@@ -534,14 +592,15 @@ def delete_condition_results(project_excel, conditions, project_config, config_p
                 if record is None:
                     continue
                 sheet_name = record['sheet']
-                if sheet_name.casefold() in ('总表', STATE_SHEET.casefold()):
+                if sheet_name.casefold() in (*SUMMARY_NAMES, STATE_SHEET.casefold()):
                     raise ValueError('工况附表记录异常，不能删除总表；原报告未修改')
                 for sheet in book.Worksheets:
                     if sheet.Name.casefold() == sheet_name.casefold():
                         sheet.Delete()
                         break
                 col = int(record['column'])
-                summary.Range(summary.Cells(4, col), summary.Cells(27, col)).ClearContents()
+                bottom = 28 if summary.Cells(28, 1).Value in ('功率阶段', '采集及功率阶段') else 27
+                summary.Range(summary.Cells(4, col), summary.Cells(bottom, col)).ClearContents()
                 state['conditions'].pop(key, None)
                 changed = True
             if changed:
@@ -564,9 +623,8 @@ def delete_condition_results(project_excel, conditions, project_config, config_p
                         excel.Quit()
                 finally:
                     pythoncom.CoUninitialize()
-        with open(report_path, 'rb') as stream:
-            if hashlib.sha256(stream.read()).digest() != original_hash:
-                raise ValueError('处理期间报告已被其他程序修改，请重新检查后再删除。')
+        if _report_digest(report_path) != original_hash:
+            raise ValueError('处理期间报告已被其他程序修改，请重新检查后再删除。')
         _commit_condition_deletion(work_path if changed else None, report_path,
                                    config_path, new_config)
         log('已删除所选工况并整理总表排列。' if changed else '所选工况尚无生成结果，已从工程配置移除。')
@@ -763,19 +821,20 @@ def _create_spreadsheet_application(log_callback):
 
 
 def _insert_native_line_chart(sheet, cond, count, last_letter, last_row,
-                              environment, log_callback):
+                              environment, log_callback, first_row=4):
     """新接口失败时改用传统原生图表接口，数据引用保持一致。"""
     import pywintypes
 
     before_count = sheet.ChartObjects().Count
     try:
-        sheet.Range(f'A1:A{last_row},C1:{last_letter}{last_row}').Select()
+        # The explicit SERIES formulas below point at all data. Give automatic
+        # chart creation only a small preview for large development reports.
+        preview_end = min(last_row, first_row + 31) if first_row == 5 else last_row
+        sheet.Range(f'A1:A{preview_end},C1:{last_letter}{preview_end}').Select()
         container = sheet.Shapes.AddChart2(-1, EXCEL_LINE_CHART)
         chart = container.Chart
         if chart.SeriesCollection().Count != count:
             raise ValueError('自动识别的温度系列数量不正确')
-        for series_idx in range(1, count + 1):
-            chart.SeriesCollection(series_idx).XValues = sheet.Range(f'A3:A{last_row}')
     except (AttributeError, ValueError, pywintypes.com_error) as modern_error:
         # 部分程序在报错前已创建空图表，只清理本次调用产生的对象。
         while sheet.ChartObjects().Count > before_count:
@@ -790,14 +849,8 @@ def _insert_native_line_chart(sheet, cond, count, last_letter, last_row,
             chart.ChartType = EXCEL_LINE_CHART
             while chart.SeriesCollection().Count:
                 chart.SeriesCollection(1).Delete()
-            sheet_ref = "'" + sheet.Name.replace("'", "''") + "'!"
-            for series_idx in range(1, count + 1):
-                column = get_column_letter(series_idx + 2)
-                series = chart.SeriesCollection().NewSeries()
-                series.Formula = (
-                    f'=SERIES({sheet_ref}${column}$1:${column}$2,'
-                    f'{sheet_ref}$A$3:$A${last_row},'
-                    f'{sheet_ref}${column}$3:${column}${last_row},{series_idx})')
+            for _ in range(count):
+                chart.SeriesCollection().NewSeries()
             chart.HasLegend = count > 1
             if chart.HasLegend:
                 chart.Legend.Position = -4107  # xlLegendPositionBottom
@@ -808,17 +861,40 @@ def _insert_native_line_chart(sheet, cond, count, last_letter, last_row,
                 f'AddChart2：{modern_error}；ChartObjects.Add：{legacy_error}。'
                 '请提供本机 Excel/WPS 的名称与版本，以便继续排查。') from legacy_error
 
+    sheet_ref = "'" + sheet.Name.replace("'", "''") + "'!"
+    for series_idx, label in enumerate(cond['chart_labels'], 1):
+        column = get_column_letter(series_idx + 2)
+        series = chart.SeriesCollection(series_idx)
+        series.Formula = (
+            f'=SERIES({sheet_ref}${column}$1,{sheet_ref}$A${first_row}:$A${last_row},'
+            f'{sheet_ref}${column}${first_row}:${column}${last_row},{series_idx})')
+        series.Name = label
+    chart.HasLegend = True
+    chart.Legend.Position = -4107  # xlLegendPositionBottom
+    # A date axis groups all scans on the same day at midnight in Excel/WPS.
+    axis = chart.Axes(1)
+    axis.CategoryType = 2  # xlCategoryScale: one category per sample
+    axis.TickLabelSpacing = max(1, math.ceil((last_row - first_row + 1) / 7))
+    dates = sorted({from_excel(row[0]).date() for row in cond['data']
+                    if isinstance(row[0], (int, float)) and row[0] >= 1})
+    title = cond['name']
+    if dates:
+        axis.TickLabels.NumberFormat = 'hh:mm:ss'
+        period = dates[0].isoformat()
+        if dates[-1] != dates[0]:
+            period += ' 至 ' + dates[-1].isoformat()
+        title += ' · ' + period
     container.Left = sheet.Range('E9').Left
     container.Top = sheet.Range('E9').Top
     container.Width = REFERENCE_CHART_WIDTH
     container.Height = REFERENCE_CHART_HEIGHT
     chart.HasTitle = True
-    chart.ChartTitle.Text = cond['name']
+    chart.ChartTitle.Text = title
     container.Placement = EXCEL_MOVE_AND_SIZE
 
 
 def _write_detail(excel, workbook, reference_sheet, cond, channels_config,
-                  log_callback=None):
+                  log_callback=None, first_row=4):
     name = cond['sheet_name']
     for sheet in workbook.Worksheets:
         if sheet.Name == name:
@@ -840,7 +916,7 @@ def _write_detail(excel, workbook, reference_sheet, cond, channels_config,
     count = len(channels_config)
     last_col = count + 2  # A=扫描时间，B=扫描编号，C起为温度通道。
     last_letter = get_column_letter(last_col)
-    last_row = len(cond['data']) + 3
+    last_row = len(cond['data']) + first_row - 1
     sheet.Range('A1:P829').ClearContents()
 
     # Excel 跨工作簿复制工作表不会完整保留列宽和默认行高。
@@ -865,30 +941,68 @@ def _write_detail(excel, workbook, reference_sheet, cond, channels_config,
     sheet.Range(sheet.Cells(3, 1), sheet.Cells(3, last_col)).Value = (
         cond['headers'],
     )
-    sheet.Range(sheet.Cells(4, 1), sheet.Cells(last_row, last_col)).Value = tuple(cond['data'])
+    if first_row == 5:
+        # Keep each COM transfer bounded so a large worksheet does not require
+        # Excel to marshal millions of VARIANTs in one call.
+        rows = cond['data']
+        block_size = 4096
+        for offset in range(0, len(rows), block_size):
+            block = rows[offset:offset + block_size]
+            start = first_row + offset
+            sheet.Range(sheet.Cells(start, 1),
+                        sheet.Cells(start + len(block) - 1, last_col)).Value2 = tuple(block)
+    else:
+        sheet.Range(sheet.Cells(first_row, 1), sheet.Cells(last_row, last_col)).Value = tuple(cond['data'])
     sheet.Range(sheet.Cells(2, 3), sheet.Cells(2, last_col)).Formula = (
-        tuple(f'=MAX({get_column_letter(col)}4:{get_column_letter(col)}{last_row})'
+        tuple(f'=MAX({get_column_letter(col)}{first_row}:{get_column_letter(col)}{last_row})'
               for col in range(3, last_col + 1)),
     )
-    sheet.Range(f'A4:A{last_row}').NumberFormat = reference_sheet.Range('A4').NumberFormat
+    sheet.Range(f'A{first_row}:A{last_row}').NumberFormat = reference_sheet.Range('A4').NumberFormat
 
     # 全量选中扫描时间与温度通道，跳过 B 列扫描编号，交给 Excel 原生插入折线图。
     workbook.Activate()
     sheet.Activate()
     excel.ActiveWindow.Zoom = 55
+    cond['chart_labels'] = [
+        f"{channel['custom_name'].strip()}（最高 {maximum:.2f}℃）"
+        for channel, maximum in zip(channels_config, cond['maxima'])
+    ]
     _insert_native_line_chart(sheet, cond, count, last_letter, last_row,
                               _excel_environment_description(excel),
-                              log_callback or (lambda message: None))
+                              log_callback or (lambda message: None), first_row)
 
     if cond['powerz']:
         # 14 个及以下通道保持 Q1；更多通道时始终紧接最后一个温度列。
         powerz_col = max(17, last_col + 1)
-        _add_picture(sheet, cond['powerz'],
-                     f'{get_column_letter(powerz_col)}1',
-                     285, 210, 'ThermalPowerZ')
+        with tempfile.TemporaryDirectory(prefix='thermal_powerz_') as folder:
+            picture = os.path.join(folder, 'powerz.png')
+            replaced = write_titled_powerz(cond['powerz'], sheet.Name, picture, square=first_row == 5)
+            _add_picture(sheet, picture, f'{get_column_letter(powerz_col)}1',
+                         285, 210, 'ThermalPowerZ')
+            if not replaced and log_callback:
+                log_callback(f'[{name}] 截图顶部未识别到独立标题栏，已在原图上方添加附表名。')
     return last_row
 
 
+def _apply_shared_temperature_scale(workbook, summary, state):
+    """Use one temperature scale across new and previously generated conditions."""
+    peaks = summary.Range('D5:O27').Value
+    highest = max((value for row in peaks for value in row
+                   if isinstance(value, (float, int)) and math.isfinite(value)), default=0)
+    ceiling = max(10, 10 * math.ceil(highest * 1.1 / 10))
+    major_unit = max(2, 5 * math.ceil(ceiling / 40))
+    condition_names = {record['sheet'].casefold() for record in state['conditions'].values()}
+    for sheet in workbook.Worksheets:
+        if sheet.Name.casefold() in condition_names and sheet.ChartObjects().Count:
+            axis = sheet.ChartObjects(1).Chart.Axes(2)
+            axis.MinimumScaleIsAuto = True
+            axis.MaximumScaleIsAuto = True
+            axis.MaximumScale = ceiling
+            axis.MinimumScale = 0
+            axis.MajorUnit = major_unit
+
+
+@_exclusive_report_operation
 def process_bulk_thermal_data(project_excel, condition_configs, fixed_images,
                               channels_config, progress_callback, log_callback,
                               project_config=None):
@@ -933,6 +1047,7 @@ def process_bulk_thermal_data(project_excel, condition_configs, fixed_images,
     os.close(temp_fd)
     try:
         shutil.copy2(report_path, work_path)
+        original_hash = _report_digest(work_path)
         may_strip_links = _clean_external_links(work_path, log_callback)
         legacy_hashes = _legacy_picture_hashes(work_path)
 
@@ -954,7 +1069,7 @@ def process_bulk_thermal_data(project_excel, condition_configs, fixed_images,
                 raise PermissionError(f'工程 Excel 正在被占用：{report_path}')
             reference_book = excel.Workbooks.Open(os.path.abspath(reference_path), 0, True)
             reference_sheet = reference_book.Worksheets.Item(1)
-            summary = output_book.Worksheets.Item('总表')
+            summary = _get_summary_sheet(output_book)
             state = _load_report_state(output_book)
             _validate_condition_positions(state)
             _release_empty_condition_reservations(output_book, summary, state)
@@ -963,18 +1078,30 @@ def process_bulk_thermal_data(project_excel, condition_configs, fixed_images,
             _assign_conditions(output_book, summary, state, registry,
                                {item['id'] for item in prepared})
             _write_summary(summary, prepared, channels_config, state)
+            development = project_config.get('development', False)
+            if development:
+                from dev_report import configure_summary, format_detail
+                positions = configure_summary(summary, channels_config)
+                phase_settings = {_record_id(c, 'condition'): c.get('phases', {}) for c in registry}
             legacy_hashes, expected_hashes = _excel_legacy_image_hashes(
                 output_book, summary, state, image_registry, work_path)
             _write_summary_images(summary, state, selected_images, image_registry,
                                   project_config.get('deleted_image_ids', []),
                                   legacy_hashes, log_callback, expected_hashes)
             for index, cond in enumerate(prepared):
+                first_row = 5 if development else 4
                 last_row = _write_detail(excel, output_book, reference_sheet,
-                                         cond, channels_config, log_callback)
+                                         cond, channels_config, log_callback, first_row)
+                if development:
+                    column = state['conditions'][cond['id']]['column']
+                    format_detail(output_book.Worksheets.Item(cond['sheet_name']), summary,
+                                  column, cond, channels_config, positions,
+                                  phase_settings.get(cond['id'], {}), log_callback)
                 log_callback(f'[{cond["name"]}] Excel 原生折线图已插入，'
-                             f'扫描时间 A3:A{last_row}，温度 C1:'
+                             f'扫描时间 A{first_row}:A{last_row}，温度 C{first_row}:'
                              f'{get_column_letter(len(channels_config) + 2)}{last_row}')
                 progress_callback(int((index + 1) / len(prepared) * 100))
+            _apply_shared_temperature_scale(output_book, summary, state)
             _order_condition_sheets(output_book, summary, state)
             _save_report_state(output_book, state)
             summary.Activate()
@@ -985,15 +1112,21 @@ def process_bulk_thermal_data(project_excel, condition_configs, fixed_images,
             reference_book = None
         finally:
             if output_book is not None:
-                output_book.Close(False)
+                with suppress(Exception):
+                    output_book.Close(False)
             if reference_book is not None:
-                reference_book.Close(False)
+                with suppress(Exception):
+                    reference_book.Close(False)
             if excel is not None:
-                excel.Quit()
+                with suppress(Exception):
+                    excel.Quit()
             pythoncom.CoUninitialize()
 
         if may_strip_links:
             _strip_stale_external_link_parts(work_path)
+
+        if _report_digest(report_path) != original_hash:
+            raise ValueError('生成期间报告已被其他程序修改，请重新检查后再生成。')
 
         try:
             os.replace(work_path, report_path)

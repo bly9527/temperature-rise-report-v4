@@ -1,8 +1,13 @@
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from tempfile import TemporaryDirectory
+from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from thermal_processor import _assign_conditions, _release_empty_condition_reservations
+from thermal_processor import (_assign_conditions, _exclusive_report_operation,
+                               _release_empty_condition_reservations)
 from thermal_gui import WorkerThread
 
 
@@ -79,6 +84,33 @@ class ConditionCapacityTests(unittest.TestCase):
         with patch('thermal_gui.process_bulk_thermal_data', side_effect=ValueError('总表已满')):
             worker.run()
         self.assertEqual(errors, ['总表已满'])
+
+    def test_same_report_cannot_be_processed_in_two_workers(self):
+        entered = Event()
+        release = Event()
+
+        @_exclusive_report_operation
+        def hold(path):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError(path)
+
+        @_exclusive_report_operation
+        def write(path):
+            return path
+
+        with TemporaryDirectory() as folder, ThreadPoolExecutor() as pool:
+            report = Path(folder) / 'report.xlsx'
+            task = pool.submit(hold, report)
+            try:
+                self.assertTrue(entered.wait(5))
+                with self.assertRaisesRegex(ValueError, '正在另一个窗口'):
+                    write(report)
+                self.assertEqual(write(report.with_name('other.xlsx')), report.with_name('other.xlsx'))
+            finally:
+                release.set()
+            task.result()
+            self.assertEqual(write(report), report)
 
 
 if __name__ == '__main__':
